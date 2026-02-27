@@ -333,11 +333,11 @@ q = 0.00    # continuous dividend yield
 # vol : implied vol annual  (e.g. 0.20 = 20%)
 # =========================================================================
 PATH = [
-    dict(t=0.00, S=100.0, vol=0.20),   # T0      initial conditions
-    dict(t=0.50, S=150.0, vol=0.12),   # T_a=0.5 stock +50%, vol -40%
-    dict(t=0.75, S=100.0, vol=0.20),   # T_b=0.75 stock back, vol back
-    dict(t=1.00, S= 90.0, vol=0.22),   # T1=1.0  long put expiry
-    dict(t=2.00, S= 80.0, vol=0.25),   # T2=2.0  short put expiry
+    dict(t=0.0, S=122.0, vol=0.89),   # T0      initial conditions
+    dict(t=0.7, S=170.0, vol=0.50),   # T_a=0.7 stock +39%, vol crushed
+    dict(t=1.0, S=122.0, vol=0.89),   # T_b=1.0 stock back, vol back
+    dict(t=1.4, S= 90.0, vol=0.99),   # T1=1.4  long put expiry
+    dict(t=1.7, S= 60.0, vol=0.99),   # T2=1.7  short put expiry
 ]
 show_path(PATH)
 
@@ -350,14 +350,14 @@ show_path(PATH)
 # label : free text
 # =========================================================================
 QUERY = [
-    dict(t_now=0.00, K= 90.0, T_exp=1.00, opt='put', label='Long put  @ T0'),
-    dict(t_now=0.00, K= 77.0, T_exp=2.00, opt='put', label='Short put @ T0'),
+    dict(t_now=0.00, K=100.0, T_exp=1.4, opt='put', label='Long put  @ T0'),
+    dict(t_now=0.00, K= 65.0, T_exp=1.7, opt='put', label='Short put @ T0'),
 
-    dict(t_now=0.50, K= 90.0, T_exp=1.00, opt='put', label='Long put  @ T_a (0.5y)'),
-    dict(t_now=0.50, K= 77.0, T_exp=2.00, opt='put', label='Short put @ T_a (0.5y)'),
+    dict(t_now=0.7,  K=100.0, T_exp=1.4, opt='put', label='Long put  @ T_a (0.7y)'),
+    dict(t_now=0.7,  K= 65.0, T_exp=1.7, opt='put', label='Short put @ T_a (0.7y)'),
 
-    dict(t_now=0.75, K= 90.0, T_exp=1.00, opt='put', label='Long put  @ T_b (0.75y)'),
-    dict(t_now=0.75, K= 70.0, T_exp=2.00, opt='put', label='New short put K=70 @ T_b'),
+    dict(t_now=1.0,  K=100.0, T_exp=1.4, opt='put', label='Long put  @ T_b (1.0y)'),
+    dict(t_now=1.0,  K= 65.0, T_exp=1.7, opt='put', label='New short put K=65 @ T_b'),
 ]
 show_query(QUERY, PATH, r, q)
 
@@ -373,17 +373,16 @@ show_query(QUERY, PATH, r, q)
 # =========================================================================
 TRADES = [
     # --- Initial structure at T0 -------------------------------------------
-    dict(t=0.00, opt='put', K=90.0, T_exp=1.0, qty=+1, fill=None,
-         label='A: Long put K=90 T=1y'),
-    dict(t=0.00, opt='put', K=77.0, T_exp=2.0, qty=-2, fill=None,
-         label='B: Short 2x put K=77 T=2y'),
+    dict(t=0.00, opt='put', K=100., T_exp=1.4, qty=+1, fill=None,
+         label='A: Long put K=100 T=1.4y'),
+    dict(t=0.00, opt='put', K=65.0, T_exp=1.7, qty=-2, fill=None,
+         label='B: Short 2x put K=65 T=1.7y'),
 
-    # --- Phase A (T_a=0.5y): stock +50%, vol -40% -> buy back short puts ---
-    # Uncomment to record the closing trade:
-    # dict(t=0.50, opt='put', K=77.0, T_exp=2.0, qty=+2, fill=None,
-    #      label='B-close: Buy back 2x short put @ T_a'),
+    # --- Phase A (T_a=0.7y): stock +39%, vol crushed -> buy back short puts
+    dict(t=0.7, opt='put', K=65.0, T_exp=1.7, qty=+2, fill=None,
+         label='B-close: Buy back 2x short put @ T_a'),
 
-    # --- Phase B (T_b=0.75y): re-sell at lower strike ----------------------
+    # --- Phase B: re-sell at lower strike ----------------------
     # Uncomment to record the new short puts:
     # dict(t=0.75, opt='put', K=70.0, T_exp=2.0, qty=-2, fill=None,
     #      label='C: Re-sell 2x put K=70 T=2y @ T_b'),
