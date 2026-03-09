@@ -3,67 +3,109 @@
 MSTR Diagonal Put Spread — Liquidity Calibrator
 ================================================
 Run:  pip install yfinance && python mstr_options_calibrator.py
+      python mstr_options_calibrator.py --refresh   # force live fetch
 Output: mstr_options_calibrator.html  (open in any browser)
 """
 
-import json, math, sys
+import csv, json, os, sys
 from datetime import datetime, date
 
-try:
-    import yfinance as yf
-except ImportError:
-    sys.exit("yfinance not found — run: pip install yfinance")
-
-# ─── 1. FETCH DATA ────────────────────────────────────────────────────────────
-SYMBOL = "MSTR"
-print(f"Fetching {SYMBOL} option chain …")
-
-tk   = yf.Ticker(SYMBOL)
-info = tk.fast_info
-spot = round(info.last_price, 2)
-print(f"  Spot price : ${spot}")
-
-all_exps = tk.options
-print(f"  Expiries   : {len(all_exps)} series")
+# ─── 1. FETCH DATA (or load from cache) ───────────────────────────────────────
+SYMBOL     = "MSTR"
+CACHE_FILE = "mstr_options_cache.csv"
+REFRESH    = "--refresh" in sys.argv
 
 today = date.today()
 rows  = []
 
-for exp_str in all_exps:
-    exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
-    days_out = (exp_date - today).days
-    if days_out < 5:
-        continue                     # skip already-expired / same-week
-    chain = tk.option_chain(exp_str)
-    puts  = chain.puts
+if not REFRESH and os.path.exists(CACHE_FILE):
+    print(f"Loading cached data from {CACHE_FILE}  (pass --refresh to fetch live data) …")
+    spot = None
+    with open(CACHE_FILE, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if spot is None:
+                spot = float(row["spot"])
+            exp_date = datetime.strptime(row["expiry"], "%Y-%m-%d").date()
+            days_out = (exp_date - today).days
+            if days_out < 5:
+                continue
+            rows.append({
+                "expiry"   : row["expiry"],
+                "daysOut"  : days_out,
+                "strike"   : float(row["strike"]),
+                "bid"      : float(row["bid"]),
+                "ask"      : float(row["ask"]),
+                "mid"      : float(row["mid"]),
+                "oi"       : int(row["oi"]),
+                "vol"      : int(row["vol"]),
+                "iv"       : float(row["iv"]),
+                "spreadPct": float(row["spreadPct"]),
+            })
+    if spot is None:
+        sys.exit(f"Cache file {CACHE_FILE} is empty — run with --refresh")
+    print(f"  Spot price : ${spot}  (cached)")
+    print(f"  Contracts  : {len(rows)} put options loaded from cache")
 
-    for _, r in puts.iterrows():
-        strike = float(r["strike"])
-        bid    = float(r["bid"])   if r["bid"]   == r["bid"] else 0.0
-        ask    = float(r["ask"])   if r["ask"]   == r["ask"] else bid * 1.2
-        oi     = int(r["openInterest"]) if r["openInterest"] == r["openInterest"] else 0
-        vol    = int(r["volume"])       if r["volume"]       == r["volume"]       else 0
-        iv     = float(r["impliedVolatility"]) if r["impliedVolatility"] == r["impliedVolatility"] else 0.0
+else:
+    try:
+        import yfinance as yf
+    except ImportError:
+        sys.exit("yfinance not found — run: pip install yfinance")
 
-        mid = (bid + ask) / 2 if bid + ask > 0 else 0.0
-        if mid == 0:
-            continue
-        spread_pct = ((ask - bid) / mid * 100) if mid > 0 else 999
+    print(f"Fetching {SYMBOL} option chain …")
+    tk   = yf.Ticker(SYMBOL)
+    info = tk.fast_info
+    spot = round(info.last_price, 2)
+    print(f"  Spot price : ${spot}")
 
-        rows.append({
-            "expiry"    : exp_str,
-            "daysOut"   : days_out,
-            "strike"    : strike,
-            "bid"       : round(bid, 2),
-            "ask"       : round(ask, 2),
-            "mid"       : round(mid, 2),
-            "oi"        : oi,
-            "vol"       : vol,
-            "iv"        : round(iv, 4),
-            "spreadPct" : round(spread_pct, 1),
-        })
+    all_exps = tk.options
+    print(f"  Expiries   : {len(all_exps)} series")
 
-print(f"  Contracts  : {len(rows)} put options loaded")
+    for exp_str in all_exps:
+        exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+        days_out = (exp_date - today).days
+        if days_out < 5:
+            continue                     # skip already-expired / same-week
+        chain = tk.option_chain(exp_str)
+        puts  = chain.puts
+
+        for _, r in puts.iterrows():
+            strike = float(r["strike"])
+            bid    = float(r["bid"])   if r["bid"]   == r["bid"] else 0.0
+            ask    = float(r["ask"])   if r["ask"]   == r["ask"] else bid * 1.2
+            oi     = int(r["openInterest"]) if r["openInterest"] == r["openInterest"] else 0
+            vol    = int(r["volume"])       if r["volume"]       == r["volume"]       else 0
+            iv     = float(r["impliedVolatility"]) if r["impliedVolatility"] == r["impliedVolatility"] else 0.0
+
+            mid = (bid + ask) / 2 if bid + ask > 0 else 0.0
+            if mid == 0:
+                continue
+            spread_pct = ((ask - bid) / mid * 100) if mid > 0 else 999
+
+            rows.append({
+                "expiry"   : exp_str,
+                "daysOut"  : days_out,
+                "strike"   : strike,
+                "bid"      : round(bid, 2),
+                "ask"      : round(ask, 2),
+                "mid"      : round(mid, 2),
+                "oi"       : oi,
+                "vol"      : vol,
+                "iv"       : round(iv, 4),
+                "spreadPct": round(spread_pct, 1),
+            })
+
+    print(f"  Contracts  : {len(rows)} put options loaded")
+
+    # Save to CSV cache
+    if rows:
+        fieldnames = ["spot", "expiry", "daysOut", "strike", "bid", "ask", "mid", "oi", "vol", "iv", "spreadPct"]
+        with open(CACHE_FILE, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({"spot": spot, **row})
+        print(f"  Cached     → {CACHE_FILE}")
 
 # ─── 2. COMPUTE LIQUIDITY SCORES ─────────────────────────────────────────────
 max_oi  = max((r["oi"]  for r in rows), default=1) or 1

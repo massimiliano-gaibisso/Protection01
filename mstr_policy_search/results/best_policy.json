@@ -1,0 +1,28 @@
+{
+  "policy": {
+    "alpha_L": 1.0,
+    "alpha_S1": 0.8,
+    "alpha_S2": 0.65,
+    "T_L": 130,
+    "T_S1": 24,
+    "T_S2": 67,
+    "base_q1": 2,
+    "base_q2": 2,
+    "gamma": 1.0,
+    "d_min": 21
+  },
+  "strikes_at_current_spot": {
+    "K_L": 133.53,
+    "K_S1": 106.82,
+    "K_S2": 86.79
+  },
+  "metrics": {
+    "P_success": 0.0175,
+    "E_W": 2597.0561,
+    "CVaR_W": 2014.8554,
+    "P_W_positive": 1.0,
+    "E_breach_depth": 53.3323,
+    "n_rolls": 168.0,
+    "score": 1032.0561
+  }
+}
