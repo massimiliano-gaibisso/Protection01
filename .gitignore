@@ -24,6 +24,10 @@ _unicode_check.txt
 Thumbs.db
 desktop.ini
 
+# Windows reserved device names (created accidentally on Windows)
+nul
+nul.*
+
 # Virtual environments
 .venv/
 venv/
