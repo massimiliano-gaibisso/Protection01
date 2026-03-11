@@ -1,9 +1,18 @@
 """
 surface.py — Frozen option surface built from the live chain snapshot.
 
-The surface is indexed in moneyness space (K/S0) × days_out.
-All simulation queries rescale the target strike to moneyness and look up
-the equivalent strike in the original chain (frozen surface assumption).
+The surface is indexed in moneyness space (K/S_sim) × days_out and stores
+calibrated dollar prices at the chain's spot0.  All simulation queries:
+
+  1. Compute moneyness = K_target / S_simulated
+  2. Interpolate the calibrated price at (moneyness, days_out)
+  3. Scale by S_simulated / spot0
+
+Step 3 implements the homogeneity-of-degree-1 property of option prices:
+for fixed moneyness and implied-volatility surface, put prices scale linearly
+with spot.  Without this scaling the surface would return prices valid only
+near spot0, causing severe undervaluation of OTM puts (and missing time-value
+on ITM puts) when S drifts far from spot0.
 """
 import numpy as np
 import pandas as pd
@@ -25,8 +34,8 @@ class FrozenSurface:
 
     At query time:
         moneyness  = K_target / S_simulated
-        K_equiv    = moneyness * spot0          (rescale to original chain)
-        price      = interpolate(moneyness, days_out, side)
+        price_0    = interpolate(moneyness, days_out, side)   # calibrated at spot0
+        price      = price_0 * (S_simulated / spot0)          # scale to current spot
     """
 
     def __init__(self, chain_rows: list[dict], spot0: float):
@@ -75,8 +84,8 @@ class FrozenSurface:
     def price(self, K: float, days_out: float, S_sim: float, side: str = "mid") -> float | None:
         """
         Price one option.  K is the target strike at simulated spot S_sim.
-        Rescales to moneyness in the original chain.
-        Returns None if out of range.
+        Returns the calibrated price scaled by S_sim / spot0 so that prices
+        are homogeneous of degree 1 in S (fixed moneyness, fixed IV surface).
         """
         moneyness = K / S_sim
         interp = getattr(self, f"_interp_{side}")
@@ -90,6 +99,7 @@ class FrozenSurface:
         days_q = float(np.clip(days_out, days_min, days_max))
 
         val = float(interp([[mn_q, days_q]])[0])
+        val = val * (S_sim / self.spot0)   # homogeneity scaling
         return max(val, 0.0)
 
     # ── vectorized lookup (called inside simulator for all paths at once) ──
@@ -116,6 +126,7 @@ class FrozenSurface:
 
         pts    = np.stack([mn_q, days_q], axis=1)   # (n_paths, 2)
         prices = interp(pts)
+        prices = prices * (S_vec / self.spot0)      # homogeneity scaling
         return np.maximum(prices, 0.0)
 
     # ── snap to nearest liquid strike in original chain ───────────────────

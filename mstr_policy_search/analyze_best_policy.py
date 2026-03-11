@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-analyze_best_policy.py
-----------------------
-Runs the best policy and produces a full portfolio P&L breakdown:
+analyze_best_policy.py  (v4)
+----------------------------
+Full P&L breakdown for the best v4 policy.
 
   Full P&L = (S_T - S_0)               [stock leg]
            + W_options                  [cumulative realized option cash flows]
            + Pi_final                   [unrealized MTM of the open position at T]
 
-Compares to:
-  Unprotected P&L = S_T - S_0          [just hold MSTR]
-  Ideal floor P&L  = H_max * 0.70 - S_0  [the minimum the protection should have kept]
-
-Saves: results/full_pnl_analysis.csv
+Usage:
+    cd mstr_policy_search
+    python analyze_best_policy.py           # full 2000-path analysis
+    python analyze_best_policy.py --trace   # + day-by-day trace of path 0
 """
-import sys, os, io, json
+import sys, os, io, json, argparse
 import numpy as np
 import pandas as pd
 
@@ -25,231 +24,280 @@ import data_loader
 from surface import build_surface
 from bootstrap import BootstrapSampler
 from policy_grid import Policy
-from surface import FrozenSurface
 
-# ── load cached data ──────────────────────────────────────────────────────────
-# Set BTC_ERA=True to restrict bootstrap to post-2020-08-11 (Bitcoin treasury era)
-# Set BTC_ERA=False to use full history (includes dot-com -96% crashes)
-BTC_ERA = True
+# ── analysis parameters ───────────────────────────────────────────────────────
+BTC_ERA             = True
+BTC_ERA_CUTOFF      = "2020-08-11"  # matches main.py
+N_PATHS             = 2_000
+HORIZON_DAYS        = 504
+DELTA_FLOOR         = 0.80          # floor fraction (v4)
+ANNUAL_DEFAULT_PROB = 0.001         # crash overlay (matches main.py)
+COST_PER_LEG        = 1.0           # $ per contract leg per roll
+SEED                = 42
+TRACE_PATH          = 0             # path index for --trace output
 
+# ── load data ─────────────────────────────────────────────────────────────────
 chain, spot0, _ = data_loader.load_option_chain("MSTR", refresh=False)
-cutoff = data_loader.BTC_ERA_CUTOFF if BTC_ERA else None
-returns = data_loader.load_historical_returns("MSTR", refresh=False, cutoff_date=cutoff)
-surface          = build_surface(chain, spot0)
+returns = data_loader.load_historical_returns(
+    "MSTR", refresh=False,
+    cutoff_date=BTC_ERA_CUTOFF if BTC_ERA else None,
+)
+surface = build_surface(chain, spot0)
 
-# ── best policy ───────────────────────────────────────────────────────────────
-with open("results/best_policy.json") as f:
+_chain_df = pd.DataFrame(chain)
+_expiries  = sorted(_chain_df["days_out"].unique())
+
+def snap_expiry(target: int) -> int:
+    """Return the chain expiry (days_out) closest to target."""
+    return min(_expiries, key=lambda d: abs(d - target))
+
+# ── load best policy ──────────────────────────────────────────────────────────
+_json_path = os.path.join(os.path.dirname(__file__), "results", "best_policy.json")
+with open(_json_path) as f:
     bp = json.load(f)
 
 p = bp["policy"]
+T_L_snap  = snap_expiry(p["T_L"])
+T_S1_snap = snap_expiry(p["T_S1"])
+
+if T_L_snap  != p["T_L"]:
+    print(f"  NOTE: T_L  snapped {p['T_L']}d -> {T_L_snap}d (nearest liquid expiry)")
+if T_S1_snap != p["T_S1"]:
+    print(f"  NOTE: T_S1 snapped {p['T_S1']}d -> {T_S1_snap}d (nearest liquid expiry)")
+
 policy = Policy(
-    alpha_L  = p["alpha_L"],
-    alpha_S1 = p["alpha_S1"],
-    alpha_S2 = p["alpha_S2"],
-    T_L      = p["T_L"],
-    T_S1     = p["T_S1"],
-    T_S2     = p["T_S2"],
-    base_q1  = p["base_q1"],
-    base_q2  = p["base_q2"],
-    gamma    = p["gamma"],
-    d_min    = p["d_min"],
+    alpha_L     = p["alpha_L"],
+    alpha_S1    = p["alpha_S1"],
+    T_L         = T_L_snap,
+    T_S1        = T_S1_snap,
+    base_q1     = p["base_q1"],
+    beta        = p.get("beta", 0.0),
+    d_min_short = p["d_min_short"],
+    d_min_long  = p["d_min_long"],
+    eta_pct     = p.get("eta_pct", 0.0),
 )
 
-# ── simulation parameters (must match main.py fine stage) ────────────────────
-N_PATHS      = 2_000
-HORIZON_DAYS = 504
-DELTA        = 0.30   # floor = H * (1 - delta)
-SEED         = 42
+print(f"\nPolicy (v4):")
+print(f"  alpha_L={policy.alpha_L}  alpha_S1={policy.alpha_S1}")
+print(f"  T_L={policy.T_L}d  T_S1={policy.T_S1}d  q1={policy.base_q1}")
+print(f"  beta={policy.beta}  d_min_S={policy.d_min_short}  d_min_L={policy.d_min_long}  eta={policy.eta_pct:+.0%}")
+print(f"  At spot={spot0:.2f}: K_L={spot0*policy.alpha_L:.2f}  K_S1={spot0*policy.alpha_S1:.2f}")
 
-print(f"\nRegenerating {N_PATHS} fine paths (seed={SEED}, horizon={HORIZON_DAYS}d) ...")
+# ── parse args ────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument("--trace", action="store_true", help="Print day-by-day trace of path 0")
+args, _ = parser.parse_known_args()
+trace = args.trace
+
+# ── generate paths ────────────────────────────────────────────────────────────
+print(f"\nGenerating {N_PATHS} paths (seed={SEED}, horizon={HORIZON_DAYS}d, "
+      f"crash_prob={ANNUAL_DEFAULT_PROB*100:.3f}%/yr) ...")
 sampler = BootstrapSampler(returns, seed=SEED)
-paths   = sampler.sample_paths(N_PATHS, HORIZON_DAYS, spot0)  # (N, 505)
+paths   = sampler.sample_paths(N_PATHS, HORIZON_DAYS, spot0,
+                                annual_default_prob=ANNUAL_DEFAULT_PROB)
+n_crashed = int((paths[:, -1] < 1.0).sum())
+print(f"  Paths shape: {paths.shape}  |  crashed paths (end<$1): {n_crashed}")
 
-print(f"Re-running best policy simulation with full tracking ...")
+# ── v4 simulation ─────────────────────────────────────────────────────────────
+print("Running v4 simulation ...")
 
-# ── full simulation with extra tracking ──────────────────────────────────────
-# We replicate simulate_policy logic but also record:
-#   S_final[i]   = paths[i, -1]
-#   H_max[i]     = max(paths[i, :])   [peak high-water mark over path]
-#   Pi_final[i]  = option portfolio MTM at day 504 (final open position)
-
-S = paths                                          # (N_PATHS, 505)
-n_paths = N_PATHS
+S  = paths                                              # (N_PATHS, HORIZON_DAYS+1)
+n  = N_PATHS
+q1 = float(policy.base_q1)
 
 # High-water mark
 H = np.zeros_like(S)
 H[:, 0] = S[:, 0]
 
-# ── Initial inception cash flow
-def inception_cf(policy, surface, spot0):
-    K_L  = spot0 * policy.alpha_L
-    K_S1 = spot0 * policy.alpha_S1
-    cost = surface.price(K_L,  policy.T_L,  spot0, "ask") or 0.0
-    recv = policy.base_q1 * (surface.price(K_S1, policy.T_S1, spot0, "bid") or 0.0)
-    if policy.alpha_S2 > 0:
-        K_S2 = spot0 * policy.alpha_S2
-        recv += policy.base_q2 * (surface.price(K_S2, policy.T_S2, spot0, "bid") or 0.0)
-    return recv - cost
+# ── inception cash flow ────────────────────────────────────────────────────────
+K_L_inc       = spot0 * policy.alpha_L
+K_S1_inc      = spot0 * policy.alpha_S1
+long_ask_inc  = surface.price(K_L_inc,  policy.T_L,  spot0, side="ask") or 0.0
+short_bid_inc = surface.price(K_S1_inc, policy.T_S1, spot0, side="bid") or 0.0
+W_inc         = q1 * short_bid_inc - long_ask_inc - (1.0 + q1) * COST_PER_LEG
 
-W              = np.full(n_paths, inception_cf(policy, surface, spot0))
-K_L_cur        = np.full(n_paths, spot0 * policy.alpha_L)
-K_S1_cur       = np.full(n_paths, spot0 * policy.alpha_S1)
-K_S2_cur       = np.full(n_paths, spot0 * policy.alpha_S2) if policy.alpha_S2 > 0 else None
-theta_age      = np.zeros(n_paths, dtype=int)
-days_since_roll= np.full(n_paths, policy.d_min, dtype=int)
-q1             = np.full(n_paths, float(policy.base_q1))
-q2             = np.full(n_paths, float(policy.base_q2)) if policy.alpha_S2 > 0 else np.zeros(n_paths)
-breach         = np.zeros((n_paths, HORIZON_DAYS), dtype=np.int8)
-roll_count     = np.zeros(n_paths, dtype=int)
-breach_depth_sum = np.zeros(n_paths)
+W = np.full(n, W_inc)
 
-# S_10pct for C3 (same as simulator.py)
-rng10 = np.random.default_rng(0)
-log_1yr = np.sum(rng10.choice(returns, size=(5000, 252), replace=True), axis=1)
-S_10pct = spot0 * np.exp(np.percentile(log_1yr, 10))
+if trace:
+    print(f"\n{'='*72}")
+    print(f"PATH {TRACE_PATH} TRACE  (S0={spot0:.4f})")
+    print(f"{'='*72}")
+    print(f"INCEPTION (day 0)")
+    print(f"  Long  put : K={K_L_inc:.4f}  T={policy.T_L}d  ask = surface({K_L_inc:.2f}, {policy.T_L}d, S={spot0:.2f}) = {long_ask_inc:.4f}")
+    print(f"  Short put : K={K_S1_inc:.4f}  T={policy.T_S1}d  bid = surface({K_S1_inc:.2f}, {policy.T_S1}d, S={spot0:.2f}) = {short_bid_inc:.4f}  x{q1:.0f}")
+    print(f"  Net W = {q1:.0f} x {short_bid_inc:.4f} - {long_ask_inc:.4f} - (1+{q1:.0f}) x {COST_PER_LEG:.2f} = {W_inc:.4f}")
+    print(f"{'─'*72}")
 
-def q_max_c3(K_L, K_S, S_10pct, floor_val):
-    if K_S > S_10pct:
-        return max(1, int((K_L - floor_val) / (K_S - S_10pct)))
-    return 99
+# ── leg state ──────────────────────────────────────────────────────────────────
+K_L  = np.full(n, K_L_inc)
+K_S1 = np.full(n, K_S1_inc)
 
-# store final-day portfolio state to compute Pi_final
-Pi_final_arr   = np.zeros(n_paths)
+# Independent leg clocks (v4 design)
+theta_short          = 0                                    # scalar: uniform, calendar only
+theta_long           = np.zeros(n, dtype=int)              # per-path: floor trigger resets individually
+days_since_long_roll = np.full(n, policy.d_min_long, dtype=int)
 
+breach           = np.zeros((n, HORIZON_DAYS), dtype=np.int8)
+breach_depth_sum = np.zeros(n)
+roll_count       = np.zeros(n, dtype=int)
+Pi_final_arr     = np.zeros(n)
+
+# ── main day loop ──────────────────────────────────────────────────────────────
 for d in range(1, HORIZON_DAYS + 1):
     H[:, d] = np.maximum(H[:, d - 1], S[:, d])
-    theta_age += 1
-    days_since_roll += 1
+    theta_short          += 1
+    theta_long           += 1
+    days_since_long_roll += 1
 
-    T_L_rem  = policy.T_L  - theta_age
-    T_S1_rem = policy.T_S1 - theta_age
-    T_S2_rem = policy.T_S2 - theta_age if policy.alpha_S2 > 0 else 0
+    T_S1_rem = policy.T_S1 - theta_short          # scalar
+    T_L_rem  = policy.T_L  - theta_long           # (n,) array
 
-    T_L_v  = np.clip(T_L_rem,  1, policy.T_L)
-    T_S1_v = np.clip(T_S1_rem, 1, policy.T_S1)
+    # ── portfolio MTM ─────────────────────────────────────────────────────────
+    T_L_vec  = np.clip(T_L_rem,  1, policy.T_L)
+    T_S1_vec = float(max(T_S1_rem, 1))
 
-    lp_val  = surface.price_vector(K_L_cur,  T_L_v,  S[:, d], "mid")
-    sp1_val = surface.price_vector(K_S1_cur, T_S1_v, S[:, d], "mid")
-    lp_val  = np.maximum(lp_val,  np.maximum(K_L_cur  - S[:, d], 0.0))
-    sp1_val = np.maximum(sp1_val, np.maximum(K_S1_cur - S[:, d], 0.0))
-    Pi      = lp_val - q1 * sp1_val
-
-    if policy.alpha_S2 > 0:
-        T_S2_v  = np.clip(T_S2_rem, 1, policy.T_S2)
-        sp2_val = surface.price_vector(K_S2_cur, T_S2_v, S[:, d], "mid")
-        sp2_val = np.maximum(sp2_val, np.maximum(K_S2_cur - S[:, d], 0.0))
-        Pi     -= q2 * sp2_val
+    lp_val  = surface.price_vector(K_L,  T_L_vec,                    S[:, d], side="mid")
+    sp1_val = surface.price_vector(K_S1, np.full(n, T_S1_vec),       S[:, d], side="mid")
+    # Intrinsic floor for deep-ITM puts (surface extrapolation can underestimate)
+    lp_val  = np.maximum(lp_val,  np.maximum(K_L  - S[:, d], 0.0))
+    sp1_val = np.maximum(sp1_val, np.maximum(K_S1 - S[:, d], 0.0))
+    Pi = lp_val - q1 * sp1_val
 
     if d == HORIZON_DAYS:
         Pi_final_arr = Pi.copy()
 
-    V   = S[:, d] + W + Pi      # total wealth: stock + realized cash + open MTM
-    Flr = H[:, d] * (1.0 - DELTA)
-    breached = (V < Flr)
+    # ── beta-blended floor ────────────────────────────────────────────────────
+    floor_ref = (1.0 - policy.beta) * spot0 + policy.beta * H[:, d]
+    Flr       = DELTA_FLOOR * floor_ref
+
+    # ── breach detection ──────────────────────────────────────────────────────
+    V        = S[:, d] + W + Pi
+    breached = V < Flr
     breach[:, d - 1] = breached.astype(np.int8)
     breach_depth_sum += np.where(breached, Flr - V, 0.0)
 
-    R_calendar = (T_S1_rem <= policy.d_min)
-    R_floor    = (
-        (K_L_cur < Flr) &
-        (S[:, d] * policy.alpha_L > K_L_cur) &
-        (days_since_roll >= policy.d_min)
+    # ── roll triggers ─────────────────────────────────────────────────────────
+    R_short      = (T_S1_rem <= policy.d_min_short)             # scalar bool
+    R_long_cal   = (T_L_rem  <= policy.d_min_long)              # (n,) bool
+    R_long_floor = (
+        (K_L < Flr) &
+        (S[:, d] * policy.alpha_L > K_L) &
+        (days_since_long_roll >= policy.d_min_long)
     )
-    roll_mask = R_calendar | R_floor
+    R_long = R_long_cal | R_long_floor                          # (n,) bool
 
-    if roll_mask.any():
-        idx = np.where(roll_mask)[0]
-        S_r = S[idx, d]
-        T_L_q  = np.clip(T_L_rem,  1, policy.T_L)
-        T_S1_q = np.clip(T_S1_rem, 1, policy.T_S1)
+    # ── trace: per-day compact line ───────────────────────────────────────────
+    if trace and TRACE_PATH < n:
+        tp  = TRACE_PATH
+        tag = ""
+        if R_short:        tag += " ROLL_S"
+        if R_long[tp]:     tag += " ROLL_L"
+        if breached[tp]:   tag += " BREACH"
+        if not tag:        tag  = " ok"
+        print(
+            f"  d{d:3d}: S={S[tp,d]:8.2f}  H={H[tp,d]:8.2f}  Flr={Flr[tp]:8.2f}  "
+            f"V={V[tp]:8.2f}(S{S[tp,d]:+.2f}+W{W[tp]:+.2f}+Pi{Pi[tp]:+.2f})"
+            f"  tS={theta_short:3d} tL={theta_long[tp]:3d}{tag}"
+        )
 
-        lp_bid  = surface.price_vector(K_L_cur[idx],  T_L_q[idx],  S_r, "bid")
-        sp1_bid = surface.price_vector(K_S1_cur[idx], T_S1_q[idx], S_r, "bid")
-        lp_bid  = np.maximum(lp_bid,  np.maximum(K_L_cur[idx]  - S_r, 0.0))
-        sp1_bid = np.maximum(sp1_bid, np.maximum(K_S1_cur[idx] - S_r, 0.0))
-        cash_in = lp_bid + q1[idx] * sp1_bid
-        if policy.alpha_S2 > 0:
-            T_S2_q  = np.clip(T_S2_rem, 1, policy.T_S2)
-            sp2_bid = surface.price_vector(K_S2_cur[idx], T_S2_q[idx], S_r, "bid")
-            sp2_bid = np.maximum(sp2_bid, np.maximum(K_S2_cur[idx] - S_r, 0.0))
-            cash_in += q2[idx] * sp2_bid
+    # ── execute short roll (all paths simultaneously) ─────────────────────────
+    if R_short:
+        T_S1_q = max(T_S1_rem, 1)
 
-        K_L_new  = S_r * policy.alpha_L
-        K_S1_new = S_r * policy.alpha_S1
-        K_S2_new = S_r * policy.alpha_S2 if policy.alpha_S2 > 0 else None
+        sp1_ask_close = surface.price_vector(
+            K_S1, np.full(n, float(T_S1_q)), S[:, d], side="ask"
+        )
+        sp1_ask_close = np.maximum(sp1_ask_close, np.maximum(K_S1 - S[:, d], 0.0))
 
-        deficit  = np.maximum(0.0, -W[idx])
-        P_S1_ask = surface.price_vector(K_S1_new, np.full(len(idx), float(policy.T_S1)), S_r, "ask")
-        floor_r  = H[idx, d] * (1.0 - DELTA)
-        q_max1   = np.array([q_max_c3(K_L_new[i], K_S1_new[i], S_10pct, floor_r[i]) for i in range(len(idx))], dtype=float)
-        q1_new   = np.clip(np.floor(policy.base_q1 + policy.gamma * deficit / (P_S1_ask + 1e-6)), 1, q_max1)
+        K_S1_new    = S[:, d] * policy.alpha_S1
+        sp1_bid_new = surface.price_vector(
+            K_S1_new, np.full(n, float(policy.T_S1)), S[:, d], side="bid"
+        )
 
-        q2_new = np.zeros(len(idx))
-        if policy.alpha_S2 > 0:
-            P_S2_ask = surface.price_vector(K_S2_new, np.full(len(idx), float(policy.T_S2)), S_r, "ask")
-            q_max2   = np.array([q_max_c3(K_L_new[i], K_S2_new[i], S_10pct, floor_r[i]) for i in range(len(idx))], dtype=float)
-            q2_new   = np.clip(np.floor(policy.base_q2 + policy.gamma * deficit / (P_S2_ask + 1e-6)), 0, q_max2)
+        # Short roll: receive new bid, pay close ask, cost = 2 legs per contract
+        C_short = q1 * (sp1_bid_new - sp1_ask_close) - 2.0 * q1 * COST_PER_LEG
+        W      += C_short
+        K_S1    = K_S1_new
+        theta_short = 0
+        roll_count += 1
 
-        cash_out  = surface.price_vector(K_L_new, np.full(len(idx), float(policy.T_L)), S_r, "ask")
-        cash_recv = q1_new * surface.price_vector(K_S1_new, np.full(len(idx), float(policy.T_S1)), S_r, "bid")
-        if policy.alpha_S2 > 0:
-            cash_recv += q2_new * surface.price_vector(K_S2_new, np.full(len(idx), float(policy.T_S2)), S_r, "bid")
+        if trace and TRACE_PATH < n:
+            tp = TRACE_PATH
+            print(
+                f"    >> SHORT ROLL  d{d}: K_S1 {K_S1[tp]:.4f} -> {K_S1_new[tp]:.4f}"
+                f"  T_rem={T_S1_q}d -> {policy.T_S1}d"
+                f"  ask_close=surface({K_S1[tp]:.2f},{T_S1_q}d,{S[tp,d]:.2f})={sp1_ask_close[tp]:.4f}"
+                f"  bid_new=surface({K_S1_new[tp]:.2f},{policy.T_S1}d,{S[tp,d]:.2f})={sp1_bid_new[tp]:.4f}"
+                f"  C_S={q1:.0f}x({sp1_bid_new[tp]:.4f}-{sp1_ask_close[tp]:.4f})-2x{q1:.0f}x{COST_PER_LEG}={C_short[tp]:+.4f}"
+                f"  W={W[tp]:.4f}"
+            )
 
-        C_roll = cash_in + cash_recv - cash_out
-        W[idx] += C_roll
+    # ── execute long roll (per-path subset) ───────────────────────────────────
+    if R_long.any():
+        idx = np.where(R_long)[0]
+        S_r   = S[idx, d]
+        T_L_q = np.clip(T_L_rem[idx], 1, policy.T_L)
 
-        K_L_cur[idx]  = K_L_new
-        K_S1_cur[idx] = K_S1_new
-        if policy.alpha_S2 > 0:
-            K_S2_cur[idx] = K_S2_new
-        q1[idx] = q1_new
-        q2[idx] = q2_new
-        theta_age[idx] = 0
-        days_since_roll[idx] = 0
-        roll_count[idx] += 1
+        lp_bid_close = surface.price_vector(K_L[idx], T_L_q, S_r, side="bid")
+        lp_bid_close = np.maximum(lp_bid_close, np.maximum(K_L[idx] - S_r, 0.0))
 
-# ── final values ──────────────────────────────────────────────────────────────
-S_T    = S[:, -1]              # final MSTR price at day 504
-H_max  = H[:, -1]             # peak high-water mark (H is monotone non-decreasing)
-W_opts = W                    # cumulative option cash flow (inception + all rolls)
+        K_L_new    = S_r * policy.alpha_L
+        lp_ask_new = surface.price_vector(
+            K_L_new, np.full(len(idx), float(policy.T_L)), S_r, side="ask"
+        )
+        lp_ask_new = np.maximum(lp_ask_new, np.maximum(K_L_new - S_r, 0.0))
 
-# ── P&L components ────────────────────────────────────────────────────────────
-stock_pnl       = S_T - spot0                   # stock-only P&L (no options)
-full_pnl        = stock_pnl + W_opts + Pi_final_arr  # total protected portfolio P&L
+        # Long roll: receive old bid, pay new ask, cost = 2 legs
+        C_long = lp_bid_close - lp_ask_new - 2.0 * COST_PER_LEG
+        W[idx]               += C_long
+        K_L[idx]              = K_L_new
+        theta_long[idx]       = 0
+        days_since_long_roll[idx] = 0
+        roll_count[idx]      += 1
 
-# ideal_floor_pnl: the minimum P&L the strategy "should" have delivered
-# if the floor V >= H_max * 0.70 was always maintained.
-# At the end: V_min_required = H_max * 0.70
-# V = S_T + Pi_final, so protected P&L >= H_max * 0.70 - spot0 IF the strategy worked.
-# We define this as the "protection target" = what the floor guarantees at end of path.
-ideal_floor_pnl = H_max * (1.0 - DELTA) - spot0   # = H_max * 0.70 - 133.53
+        if trace and TRACE_PATH < n and (TRACE_PATH in idx):
+            i       = int(np.where(idx == TRACE_PATH)[0][0])
+            trigger = "calendar" if R_long_cal[TRACE_PATH] else "floor"
+            tp      = TRACE_PATH
+            print(
+                f"    >> LONG  ROLL ({trigger})  d{d}: K_L {K_L[tp]:.4f} -> {K_L_new[i]:.4f}"
+                f"  T_rem={T_L_q[i]}d -> {policy.T_L}d"
+                f"  bid_close=surface({K_L[tp]:.2f},{T_L_q[i]}d,{S[tp,d]:.2f})={lp_bid_close[i]:.4f}"
+                f"  ask_new=surface({K_L_new[i]:.2f},{policy.T_L}d,{S[tp,d]:.2f})={lp_ask_new[i]:.4f}"
+                f"  C_L={lp_bid_close[i]:.4f}-{lp_ask_new[i]:.4f}-2x{COST_PER_LEG}={C_long[i]:+.4f}"
+                f"  W={W[tp]:.4f}"
+            )
 
-# protection_gap: how much full_pnl beats (or misses) the ideal floor
+if trace:
+    print(f"{'─'*72}")
+    print(f"PATH {TRACE_PATH} SUMMARY: total rolls={roll_count[TRACE_PATH]}  W_final={W[TRACE_PATH]:.4f}")
+    print(f"{'='*72}\n")
+
+# ── aggregate ──────────────────────────────────────────────────────────────────
+S_T    = S[:, -1]
+H_max  = H[:, -1]
+W_opts = W.copy()
+
+ever_breached     = breach.any(axis=1)
+total_breach_days = int(breach.sum())
+n_breach_paths    = int(ever_breached.sum())
+avg_breach_depth  = float(breach_depth_sum.sum() / max(total_breach_days, 1))
+
+stock_pnl       = S_T - spot0
+full_pnl        = stock_pnl + W_opts + Pi_final_arr
+
+# ideal floor at end of path: depends on beta
+floor_ref_final = (1.0 - policy.beta) * spot0 + policy.beta * H_max
+ideal_floor_pnl = DELTA_FLOOR * floor_ref_final - spot0
 protection_gap  = full_pnl - ideal_floor_pnl
 
-ever_breached   = breach.any(axis=1)
-
-# ── build output dataframe ───────────────────────────────────────────────────
-df = pd.DataFrame({
-    "path_idx":       np.arange(N_PATHS),
-    "S_T":            S_T.round(2),
-    "H_max":          H_max.round(2),
-    "stock_pnl":      stock_pnl.round(2),      # S_T - S_0 (unprotected)
-    "W_options":      W_opts.round(2),          # cumulative option cash flow
-    "Pi_final":       Pi_final_arr.round(2),    # open option MTM at day 504
-    "full_pnl":       full_pnl.round(2),        # total P&L = stock + options realized + unrealized
-    "ideal_floor_pnl":ideal_floor_pnl.round(2), # minimum P&L implied by the floor guarantee
-    "protection_gap": protection_gap.round(2),  # full_pnl - ideal_floor_pnl (>0 = exceeded floor)
-    "ever_breached":  ever_breached.astype(int),
-})
-
-# ── summary print ─────────────────────────────────────────────────────────────
+# ── print results ─────────────────────────────────────────────────────────────
 def pct(label, arr, q):
     return f"  {label:28s}: {np.percentile(arr, q):+10.2f}"
 
 print()
 print("=" * 65)
-print("  COMPONENT 1: Stock-only P&L  (S_T - S_0,  no options)")
+print("  COMPONENT 1: Stock-only P&L  (S_T - S_0, no options)")
 print("=" * 65)
 print(f"  S_0 (entry)                 : ${spot0:.2f}")
 for q, lbl in [(5,'P5'),(10,'P10'),(25,'P25'),(50,'Median'),(75,'P75'),(90,'P90'),(95,'P95')]:
@@ -260,18 +308,18 @@ print(f"  {'Max':28s}: {stock_pnl.max():+10.2f}")
 
 print()
 print("=" * 65)
-print("  COMPONENT 2: W_options  (all realized option cash flows)")
-print("  = inception debit + sum of all 168 roll cash flows")
-print("  NOTE: does NOT include the final open position MTM")
+print("  COMPONENT 2: W_options  (cumulative realized option cash)")
+print("  = inception net + sum of all short-roll + long-roll flows")
 print("=" * 65)
 for q, lbl in [(5,'P5'),(10,'P10'),(25,'P25'),(50,'Median'),(75,'P75'),(90,'P90'),(95,'P95')]:
     print(pct(lbl, W_opts, q))
 print(f"  {'Mean':28s}: {W_opts.mean():+10.2f}")
+print(f"  {'P(W>0)':28s}: {(W_opts > 0).mean()*100:.1f}%")
 
 print()
 print("=" * 65)
-print("  COMPONENT 3: Pi_final  (unrealized option MTM at day 504)")
-print("  = long_put_mid - q1*short1_mid - q2*short2_mid")
+print("  COMPONENT 3: Pi_final  (unrealized MTM at day 504)")
+print("  = long_put_mid - q1 x short_put_mid")
 print("=" * 65)
 for q, lbl in [(5,'P5'),(10,'P10'),(25,'P25'),(50,'Median'),(75,'P75'),(90,'P90'),(95,'P95')]:
     print(pct(lbl, Pi_final_arr, q))
@@ -286,16 +334,18 @@ for q, lbl in [(5,'P5'),(10,'P10'),(25,'P25'),(50,'Median'),(75,'P75'),(90,'P90'
 print(f"  {'Mean':28s}: {full_pnl.mean():+10.2f}")
 print(f"  {'Min':28s}: {full_pnl.min():+10.2f}")
 print(f"  {'Max':28s}: {full_pnl.max():+10.2f}")
-print(f"  P(full_pnl > 0)             : {(full_pnl > 0).mean()*100:.1f}%")
+print(f"  {'P(full_pnl > 0)':28s}: {(full_pnl > 0).mean()*100:.1f}%")
 
 print()
 print("=" * 65)
-print("  IDEAL FLOOR  (H_max * 0.70 - S_0)")
-print("  = the minimum P&L the strategy promised to protect")
+beta_desc = (
+    f"Fixed floor = {DELTA_FLOOR:.2f} x S0 = {DELTA_FLOOR*spot0:.2f}  (beta=0, never ratchets)"
+    if policy.beta == 0.0 else
+    f"Floor = {DELTA_FLOOR:.2f} x [{1-policy.beta:.2f}xS0 + {policy.beta:.2f}xH(t)]"
+)
+print(f"  FLOOR GUARANTEE  ({beta_desc})")
+print(f"  Ideal floor P&L at end = DELTA_FLOOR x floor_ref - S0")
 print("=" * 65)
-print(f"  The floor guarantee means: at all times,")
-print(f"  (S + Pi) >= H * 0.70")
-print(f"  At end of path, ideal floor P&L = H_max * 0.70 - S_0")
 for q, lbl in [(5,'P5'),(10,'P10'),(25,'P25'),(50,'Median'),(75,'P75'),(90,'P90'),(95,'P95')]:
     print(pct(lbl, ideal_floor_pnl, q))
 print(f"  {'Mean':28s}: {ideal_floor_pnl.mean():+10.2f}")
@@ -303,35 +353,97 @@ print(f"  {'Mean':28s}: {ideal_floor_pnl.mean():+10.2f}")
 print()
 print("=" * 65)
 print("  PROTECTION GAP  (full_pnl - ideal_floor_pnl)")
-print("  > 0: strategy exceeded the floor target")
-print("  < 0: strategy fell short of what the floor promised")
+print("  > 0 : strategy exceeded the floor target")
+print("  < 0 : strategy fell short of what the floor promised")
 print("=" * 65)
 for q, lbl in [(5,'P5'),(10,'P10'),(25,'P25'),(50,'Median'),(75,'P75'),(90,'P90'),(95,'P95')]:
     print(pct(lbl, protection_gap, q))
 print(f"  {'Mean':28s}: {protection_gap.mean():+10.2f}")
-print(f"  P(gap > 0)                  : {(protection_gap > 0).mean()*100:.1f}%")
+print(f"  {'P(gap > 0)':28s}: {(protection_gap > 0).mean()*100:.1f}%")
 
 print()
 print("=" * 65)
-print("  BREACH ANALYSIS")
-print("  A breach = any day where (S + W + Pi) < H * 0.70")
-print("  S = stock price,  W = cumulative realized cash,  Pi = open option MTM")
+print(f"  BREACH ANALYSIS  (V = S + W + Pi < {DELTA_FLOOR:.2f} x floor_ref)")
 print("=" * 65)
-print(f"  Paths with at least 1 breach: {ever_breached.sum()} / {N_PATHS}  ({ever_breached.mean()*100:.1f}%)")
-print(f"  Avg breach depth (when breach): ${breach_depth_sum[ever_breached].mean() / np.maximum(breach[:].any(axis=1)[ever_breached].sum(), 1):.2f}")
+print(f"  Paths with at least 1 breach : {n_breach_paths} / {N_PATHS}  ({ever_breached.mean()*100:.1f}%)")
+print(f"  P_success (zero breaches)    : {(~ever_breached).mean()*100:.1f}%")
+print(f"  Total breach-days            : {total_breach_days}")
+print(f"  Avg breach depth per event   : ${avg_breach_depth:.2f}")
 print()
-# Show breach stats by H_max bin
-bins = [0, 133, 200, 300, 500, 10000]
+
+bins   = [0, 133, 200, 300, 500, 10_000]
 labels = ["<133 (stock fell)", "133-200", "200-300", "300-500", ">500"]
 print("  Breach rate by peak H_max:")
 for i, lbl in enumerate(labels):
-    mask = (H_max >= bins[i]) & (H_max < bins[i+1])
+    mask = (H_max >= bins[i]) & (H_max < bins[i + 1])
     if mask.sum() > 0:
-        breach_rate = ever_breached[mask].mean()
-        print(f"    H_max {lbl:20s}: {mask.sum():4d} paths  breach rate={breach_rate*100:.1f}%")
+        rate = ever_breached[mask].mean()
+        print(f"    H_max {lbl:20s}: {mask.sum():4d} paths  breach rate={rate*100:.1f}%")
 
-# save
-os.makedirs("results", exist_ok=True)
-df.to_csv("results/full_pnl_analysis.csv", index=False)
-print(f"\nSaved {len(df)} rows to results/full_pnl_analysis.csv")
-print("Columns: path_idx, S_T, H_max, stock_pnl, W_options, Pi_final, full_pnl, ideal_floor_pnl, protection_gap, ever_breached")
+print()
+print(f"  Mean rolls per path          : {roll_count.mean():.1f}")
+
+# ── save CSV ───────────────────────────────────────────────────────────────────
+_results_dir = os.path.join(os.path.dirname(__file__), "results")
+os.makedirs(_results_dir, exist_ok=True)
+
+df = pd.DataFrame({
+    "path_idx":        np.arange(N_PATHS),
+    "S_T":             S_T.round(2),
+    "H_max":           H_max.round(2),
+    "stock_pnl":       stock_pnl.round(2),
+    "W_options":       W_opts.round(2),
+    "Pi_final":        Pi_final_arr.round(2),
+    "full_pnl":        full_pnl.round(2),
+    "ideal_floor_pnl": ideal_floor_pnl.round(2),
+    "protection_gap":  protection_gap.round(2),
+    "ever_breached":   ever_breached.astype(int),
+    "n_rolls":         roll_count,
+})
+_csv_path = os.path.join(_results_dir, "full_pnl_analysis.csv")
+df.to_csv(_csv_path, index=False)
+print(f"Saved {len(df)} rows to {_csv_path}")
+
+# ── recompute metrics and update best_policy.json ─────────────────────────────
+cvar_cutoff    = int(np.ceil(0.10 * N_PATHS))
+P_success_new  = float((~ever_breached).mean())
+E_W_new        = float(W_opts.mean())
+CVaR_W_new     = float(np.sort(W_opts)[:cvar_cutoff].mean()) if cvar_cutoff > 0 else float(W_opts.min())
+P_W_pos_new    = float((W_opts > 0).mean())
+E_breach_new   = avg_breach_depth
+n_rolls_new    = float(roll_count.mean())
+score_new      = P_success_new - E_breach_new / spot0   # v4 optimizer score formula
+
+bp["metrics"] = {
+    "P_success":      round(P_success_new, 4),
+    "E_W":            round(E_W_new,       4),
+    "CVaR_W":         round(CVaR_W_new,    4),
+    "P_W_positive":   round(P_W_pos_new,   4),
+    "E_breach_depth": round(E_breach_new,  4),
+    "n_rolls":        round(n_rolls_new,   1),
+    "score":          round(score_new,     4),
+}
+bp["analysis_params"] = {
+    "N_PATHS":             N_PATHS,
+    "HORIZON_DAYS":        HORIZON_DAYS,
+    "DELTA_FLOOR":         DELTA_FLOOR,
+    "ANNUAL_DEFAULT_PROB": ANNUAL_DEFAULT_PROB,
+    "BTC_ERA":             BTC_ERA,
+    "SEED":                SEED,
+}
+
+with open(_json_path, "w") as f:
+    json.dump(bp, f, indent=2)
+
+print()
+print("=" * 65)
+print("  UPDATED metrics saved to results/best_policy.json")
+print("=" * 65)
+print(f"  P_success    : {P_success_new*100:.2f}%")
+print(f"  E_W          : {E_W_new:+.2f}")
+print(f"  CVaR_W (10%) : {CVaR_W_new:+.2f}")
+print(f"  P(W>0)       : {P_W_pos_new*100:.1f}%")
+print(f"  E_breach_depth: ${E_breach_new:.2f}")
+print(f"  n_rolls      : {n_rolls_new:.1f}")
+print(f"  score        : {score_new:.4f}  (P_success - E_breach/spot)")
+print(f"  [BTC_ERA={BTC_ERA}  DELTA_FLOOR={DELTA_FLOOR}  N={N_PATHS}  H={HORIZON_DAYS}d  seed={SEED}]")

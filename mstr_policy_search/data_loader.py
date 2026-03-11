@@ -36,8 +36,10 @@ def load_option_chain(symbol: str = SYMBOL, refresh: bool = False) -> tuple[list
             for row in csv.DictReader(f):
                 if spot is None:
                     spot = float(row["spot"])
-                exp_date = datetime.strptime(row["expiry"], "%Y-%m-%d").date()
-                days_out = (exp_date - today).days
+                # Use the frozen daysOut stored at fetch time, NOT today's calendar distance.
+                # Recomputing (exp_date - today).days would silently drift every T value on
+                # each load, causing e.g. T=30 to appear as 34 four days after the fetch.
+                days_out = int(float(row["daysOut"]))
                 if days_out < 5:
                     continue
                 mid = float(row["mid"])
@@ -119,18 +121,27 @@ def load_option_chain(symbol: str = SYMBOL, refresh: bool = False) -> tuple[list
 
 # ─── Historical returns ────────────────────────────────────────────────────────
 
-def load_historical_returns(symbol: str = SYMBOL, refresh: bool = False) -> np.ndarray:
+def load_historical_returns(
+    symbol: str = SYMBOL,
+    refresh: bool = False,
+    cutoff_date: str | None = None,
+) -> np.ndarray:
     """
     Fetch maximum available MSTR daily closing prices and return log-return array.
     Results are cached to RETURNS_CACHE so yfinance is only hit once (or on --refresh).
+
+    cutoff_date : if given (e.g. "2020-08-11"), only returns on-or-after that date
+                  are included in the pool.  Use BTC_ERA_CUTOFF for the BTC-era filter.
     """
     use_cache = (not refresh) and os.path.exists(RETURNS_CACHE)
 
     if use_cache:
         print(f"Loading cached returns from {RETURNS_CACHE} ...")
         df = pd.read_csv(RETURNS_CACHE)
+        if cutoff_date is not None:
+            df = df[df["date"] >= cutoff_date]
+            print(f"  BTC-era filter applied (>= {cutoff_date}): {len(df)} days retained")
         returns = df["log_return"].values
-        fetch_date = df.attrs.get("fetch_date", "unknown") if hasattr(df, "attrs") else "cached"
         _print_return_stats(returns)
         return returns
 

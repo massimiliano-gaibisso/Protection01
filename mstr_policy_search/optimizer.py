@@ -1,103 +1,182 @@
 """
-optimizer.py -- Two-stage coarse + fine grid search.
+optimizer.py — Three-phase coordinate ascent with Common Random Numbers (CRN).
 
-Stage 1 (coarse): short horizon (63 days), 200 paths.
-    Screen for P_success >= 0.80 and keep the top 15% by E_W.
-    Purpose: eliminate clearly-bad policies fast (~13 min for 17k policies).
+Phase 1 — Random init   : evaluate N_INIT random feasible policies on search paths
+Phase 2 — Coord ascent  : from top K_STARTS seeds, run coordinate ascent on each param
+Phase 3 — Fine verify   : re-evaluate the top local optima on 2,000 fine paths
 
-Stage 2 (fine): full horizon (504 days), 2000 paths.
-    Screen for P_success >= 0.80 and rank by composite score.
-    Purpose: accurate two-year simulation for survivors.
+CRN: Phases 1 and 2 use the SAME pre-generated search paths so that path noise
+cancels in pairwise score comparisons (variance reduction).
 
-Using a short horizon in Stage 1 works because:
-- Put protection quality over 63 days correlates strongly with 504-day quality
-- E_W over 63 days (2-3 roll cycles) predicts full-horizon E_W well
-- The 63-day Python loop is 8x faster than 504-day, enabling full grid search
+Score: P_success − E_breach_depth / spot
+  → maximising this prioritises breach protection above all else.
+  → no income bias: E_W is not in the objective.
 """
 import numpy as np
 from tqdm import tqdm
 
-from policy_grid import Policy
+import policy_grid as pg
 from surface import FrozenSurface
 from simulator import simulate_policy
 
 
-def _composite_score(P_success: float, E_W: float, CVaR_W: float) -> float:
-    return (
-        1.0 * E_W
-        - 0.5 * abs(min(CVaR_W, 0.0))
-        - 2.0 * max(0.0, 0.80 - P_success) * 1000
-    )
+def _score(m: dict, spot: float) -> float:
+    return m["P_success"] - m["E_breach_depth"] / spot
+
+
+def _evaluate(
+    policy:          pg.Policy,
+    paths:           np.ndarray,
+    surface:         FrozenSurface,
+    spot0:           float,
+    delta_floor:     float,
+    cost_per_leg:    float,
+    frozen_expiries: list | None = None,
+) -> float:
+    try:
+        m = simulate_policy(policy, paths, surface, spot0,
+                            delta_floor=delta_floor, cost_per_leg=cost_per_leg,
+                            frozen_expiries=frozen_expiries)
+        return _score(m, spot0)
+    except Exception:
+        return -1e9
+
+
+def _coord_ascent(
+    seed:            pg.Policy,
+    paths:           np.ndarray,
+    surface:         FrozenSurface,
+    spot0:           float,
+    delta_floor:     float,
+    cost_per_leg:    float,
+    frozen_expiries: list | None = None,
+    rng:             np.random.Generator | None = None,
+) -> tuple:
+    """
+    Single-start coordinate ascent.  Cycles through all params until no improvement.
+    Coordinate order is shuffled on every outer pass (randomised coordinate descent)
+    so the local optimum found does not depend on the fixed alphabetical scan order.
+    Returns (best_policy, best_score).
+    """
+    current       = seed
+    current_score = _evaluate(current, paths, surface, spot0, delta_floor, cost_per_leg,
+                              frozen_expiries=frozen_expiries)
+
+    improved = True
+    while improved:
+        improved = False
+        params_order = list(pg.PARAMS)          # fresh copy each pass
+        if rng is not None:
+            rng.shuffle(params_order)           # randomise scan order
+        for param in params_order:
+            best_score    = current_score
+            best_neighbor = current
+            for neighbor in pg.neighbors(current, param):
+                if not pg.is_feasible(neighbor, spot0, surface):
+                    continue
+                s = _evaluate(neighbor, paths, surface, spot0, delta_floor, cost_per_leg,
+                              frozen_expiries=frozen_expiries)
+                if s > best_score + 1e-6:
+                    best_score    = s
+                    best_neighbor = neighbor
+            if best_neighbor is not current:
+                current       = best_neighbor
+                current_score = best_score
+                improved      = True
+
+    return current, current_score
 
 
 def run_optimization(
-    feasible_policies: list[Policy],
-    paths_coarse:      np.ndarray,    # (N1, H1+1)   -- short horizon
-    paths_fine:        np.ndarray,    # (N2, H2+1)   -- full horizon
-    surface:           FrozenSurface,
-    spot0:             float,
-    returns:           np.ndarray,
-    constraints: dict | None = None,
+    surface:         FrozenSurface,
+    spot0:           float,
+    paths_search:    np.ndarray,    # (N_SEARCH, H+1)  CRN paths for phases 1+2
+    paths_fine:      np.ndarray,    # (N_FINE,   H+1)  fresh paths for phase 3
+    delta_floor:     float = 0.80,
+    cost_per_leg:    float = 1.0,
+    n_init:          int   = 50,    # random policies in Phase 1
+    k_starts:        int   = 15,    # best seeds for Phase 2 coord ascent
+    min_p_success:   float = 0.90,  # Phase 3 filter threshold
+    rng_seed:        int   = 0,
+    frozen_expiries: list | None = None,
 ) -> list[dict]:
-    if constraints is None:
-        constraints = {
-            "min_P_success_coarse": 0.80,   # 63-day threshold
-            "min_P_success_fine":   0.80,   # 504-day threshold
-            "top_pct_coarse":       0.15,   # survivors from Stage 1
-        }
+    """
+    Returns list of result dicts sorted by score (best first).
+    Each dict: policy, P_success, E_W, CVaR_W, P_W_positive,
+               E_breach_depth, n_rolls, W_final, score.
+    """
+    rng = np.random.default_rng(rng_seed)
 
-    min_ps_coarse = constraints.get("min_P_success_coarse", 0.80)
-    min_ps_fine   = constraints.get("min_P_success_fine",   0.80)
-    top_pct       = constraints.get("top_pct_coarse",       0.15)
+    # ── Phase 1: Random init ──────────────────────────────────────────────────
+    print(f"\n{'─'*62}")
+    print(f"Phase 1 -- Random init  ({n_init} random policies, CRN search paths)")
+    print(f"{'─'*62}")
 
-    n1, h1 = paths_coarse.shape[0], paths_coarse.shape[1] - 1
-    n2, h2 = paths_fine.shape[0],   paths_fine.shape[1] - 1
-
-    # ── Stage 1: coarse ──────────────────────────────────────────────────────
-    print(f"\n{'-'*62}")
-    print(f"Stage 1 -- Coarse  ({n1:,} paths x {h1:d} days,  {len(feasible_policies):,} policies)")
-    print(f"{'-'*62}")
-
-    coarse_results = []
-    for p in tqdm(feasible_policies, desc="Stage 1", unit="policy"):
-        try:
-            m = simulate_policy(p, paths_coarse, surface, spot0, returns)
-        except Exception:
+    phase1 = []
+    for _ in tqdm(range(n_init), desc="Phase 1", unit="policy"):
+        for _attempt in range(30):        # retry until feasible
+            p = pg.random_policy(rng)
+            if pg.is_feasible(p, spot0, surface):
+                break
+        else:
             continue
-        coarse_results.append({
-            "policy":    p,
-            "P_success": m["P_success"],
-            "E_W":       m["E_W"],
-            "CVaR_W":    m["CVaR_W"],
-        })
+        s = _evaluate(p, paths_search, surface, spot0, delta_floor, cost_per_leg,
+                      frozen_expiries=frozen_expiries)
+        phase1.append((p, s))
 
-    survivors = [r for r in coarse_results if r["P_success"] >= min_ps_coarse]
-    survivors.sort(key=lambda r: r["E_W"], reverse=True)
-    n_keep = max(50, int(len(survivors) * top_pct))
-    survivors = survivors[:n_keep]
+    phase1.sort(key=lambda x: x[1], reverse=True)
+    best_p1_score, best_p1_ps = phase1[0][1], 0.0
+    if phase1:
+        m0 = simulate_policy(phase1[0][0], paths_search, surface, spot0, delta_floor, cost_per_leg,
+                             frozen_expiries=frozen_expiries)
+        best_p1_ps = m0["P_success"]
+        best_p1_breach = m0["E_breach_depth"]
+    print(f"Phase 1 complete: {len(phase1)} evaluated  -> top {k_starts} seeds for Phase 2")
+    print(f"  Best Phase-1 score: {phase1[0][1]:+.4f}  "
+          f"(P_success={best_p1_ps*100:.1f}%  E_breach=${best_p1_breach:.2f})")
 
-    print(f"Stage 1 complete: {len(coarse_results):,} evaluated --> {len(survivors):,} survivors")
+    seeds = [p for p, _ in phase1[:k_starts]]
 
-    if not survivors:
-        print("WARNING: No survivors from Stage 1. Relaxing coarse P_success to 0.50.")
-        survivors = sorted(coarse_results, key=lambda r: r["E_W"], reverse=True)
-        n_keep = max(50, len(coarse_results) // 5)
-        survivors = survivors[:n_keep]
-        print(f"  Re-survivors: {len(survivors)}")
+    # ── Phase 2: Coordinate ascent ────────────────────────────────────────────
+    print(f"\n{'─'*62}")
+    print(f"Phase 2 -- Coordinate ascent  ({len(seeds)} starts, CRN)")
+    print(f"{'─'*62}")
 
-    # ── Stage 2: fine ────────────────────────────────────────────────────────
-    print(f"\n{'-'*62}")
-    print(f"Stage 2 -- Fine  ({n2:,} paths x {h2:d} days,  {len(survivors):,} policies)")
-    print(f"{'-'*62}")
+    phase2 = []
+    for seed in tqdm(seeds, desc="Phase 2", unit="start"):
+        local_opt, local_score = _coord_ascent(
+            seed, paths_search, surface, spot0, delta_floor, cost_per_leg,
+            frozen_expiries=frozen_expiries,
+            rng=rng,                            # shared rng → shuffled coord order each pass
+        )
+        phase2.append((local_opt, local_score))
 
-    fine_results = []
-    for r in tqdm(survivors, desc="Stage 2", unit="policy"):
-        p = r["policy"]
-        try:
-            m = simulate_policy(p, paths_fine, surface, spot0, returns)
-        except Exception:
-            continue
-        score = _composite_score(m["P_success"], m["E_W"], m["CVaR_W"])
+    # Deduplicate by policy identity
+    seen:   set  = set()
+    unique: list = []
+    for p, s in sorted(phase2, key=lambda x: x[1], reverse=True):
+        if p not in seen:
+            seen.add(p)
+            unique.append((p, s))
+
+    phase2_top = unique[:k_starts]
+    m2 = simulate_policy(phase2_top[0][0], paths_search, surface, spot0, delta_floor, cost_per_leg,
+                         frozen_expiries=frozen_expiries)
+    print(f"Phase 2 complete: {len(unique)} unique local optima  -> top {len(phase2_top)} for Phase 3")
+    print(f"  Best Phase-2 score: {phase2_top[0][1]:+.4f}  "
+          f"(P_success={m2['P_success']*100:.1f}%  E_breach=${m2['E_breach_depth']:.2f})")
+
+    # ── Phase 3: Fine verification ────────────────────────────────────────────
+    print(f"\n{'─'*62}")
+    print(f"Phase 3 -- Fine verification  "
+          f"({paths_fine.shape[0]:,} paths x {paths_fine.shape[1]-1:d}d, "
+          f"{len(phase2_top)} candidates)")
+    print(f"{'─'*62}")
+
+    fine_results: list[dict] = []
+    for p, _ in tqdm(phase2_top, desc="Phase 3", unit="policy"):
+        m = simulate_policy(p, paths_fine, surface, spot0, delta_floor, cost_per_leg,
+                            frozen_expiries=frozen_expiries)
         fine_results.append({
             "policy":          p,
             "P_success":       m["P_success"],
@@ -107,16 +186,18 @@ def run_optimization(
             "E_breach_depth":  m["E_breach_depth"],
             "n_rolls":         m["n_rolls"],
             "W_final":         m["W_final"],
-            "score":           score,
+            "score":           _score(m, spot0),
         })
 
-    valid = [r for r in fine_results if r["P_success"] >= min_ps_fine]
+    valid = [r for r in fine_results if r["P_success"] >= min_p_success]
     valid.sort(key=lambda r: r["score"], reverse=True)
 
-    print(f"Stage 2 complete: {len(fine_results):,} evaluated --> {len(valid):,} meet P_success >= {min_ps_fine:.0%}")
+    n_valid = len(valid)
+    print(f"Phase 3 complete: {len(fine_results)} evaluated  -> "
+          f"{n_valid} meet P_success >= {min_p_success:.0%}")
 
     if not valid:
-        print("WARNING: No policies met fine threshold. Returning all fine results by score.")
+        print("WARNING: No policies met fine threshold. Returning all by score.")
         fine_results.sort(key=lambda r: r["score"], reverse=True)
         return fine_results
 

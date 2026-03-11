@@ -1,159 +1,218 @@
 #!/usr/bin/env python3
 """
-main.py -- Entry point for MSTR parametric policy search.
+main.py -- Entry point for MSTR parametric policy search (v4).
 
 Run:
     cd mstr_policy_search
-    python main.py             # uses cached option chain + cached returns
-    python main.py --refresh   # force live yfinance fetch for both caches
+    python main.py             # uses cached chain + cached returns
+    python main.py --refresh   # force live yfinance fetch
     python main.py --sanity    # single-policy sanity check only (fast)
 
-Key parameters (edit here):
-    ETA          -- max allowed initial net debit per share (default $15).
-                    A long 130d ATM put costs ~$23; a single short 67d 75%-OTM
-                    generates ~$6.  Most 1x1 structures cost $11-17 net; eta=15
-                    admits the full single-short space while blocking naked longs.
-    HORIZON_DAYS -- simulation horizon in trading days (504 = 2 years)
-    N_COARSE     -- paths in Stage-1 coarse screen
-    N_FINE       -- paths in Stage-2 fine evaluation
+ALL tunable parameters live here as module-level globals.
 """
 import sys
 import os
 
-# Force UTF-8 stdout on Windows to handle Unicode in print statements
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 import numpy as np
-
-# Make imports work from this directory
 sys.path.insert(0, os.path.dirname(__file__))
 
 import data_loader
 from surface import build_surface
 from bootstrap import BootstrapSampler
 import policy_grid
+from policy_grid import Policy
 from simulator import simulate_policy
 import optimizer as opt_module
 import results as results_module
-from policy_grid import Policy
 
-# ── Tunable parameters ────────────────────────────────────────────────────────
-ETA              = 15.0   # max initial net debit allowed per share (~11% of spot)
-                          # Raise to 20+ to search more structures; lower to 5 for strict self-funding
+# ══════════════════════════════════════════════════════════════════════════════
+#  ALL TUNABLE PARAMETERS  —  edit only this block
+# ══════════════════════════════════════════════════════════════════════════════
 
-HORIZON_DAYS     = 504    # 2 trading years (full evaluation horizon)
+# ── Simulation horizon ────────────────────────────────────────────────────────
+HORIZON_DAYS        = 504             # 2 trading years
 
-# Stage 1 (coarse): short horizon for speed — full grid screened in ~13 min
-HORIZON_COARSE   = 63     # days for coarse screening (2 calendar months)
-N_COARSE         = 200    # paths per policy in Stage 1
+# ── Bootstrap return pool ─────────────────────────────────────────────────────
+BTC_ERA_ONLY        = True            # True = BTC-era only (post-2020-08-11)
+BTC_ERA_CUTOFF      = "2020-08-11"   # MicroStrategy's first BTC purchase date
+                                      # BTC-era : N=1399 days, mean=+0.17%/day, std=5.87%/day
+                                      # Full history: N=6976 days, includes -96% dot-com crash
 
-# Stage 2 (fine): full horizon on survivors
-N_FINE           = 2_000  # paths per policy in Stage 2
+# ── Floor specification ───────────────────────────────────────────────────────
+DELTA_FLOOR         = 0.80            # floor = DELTA_FLOOR × reference_price
+                                      # reference = (1-beta)×S0 + beta×H(t)
+                                      # beta=0 → fixed $DELTA_FLOOR×S0 (never ratchets)
+                                      # beta=1 → trailing DELTA_FLOOR×H(t) (full HWM)
+
+# ── Crash overlay ─────────────────────────────────────────────────────────────
+ANNUAL_DEFAULT_PROB = 0.001           # 0.1% annual → ~0.20% of 504d paths crash to $0.01
+
+# ── Transaction costs ─────────────────────────────────────────────────────────
+COST_PER_LEG        = 1.0             # $ per contract leg per roll
+
+# ── Liquidity filter ──────────────────────────────────────────────────────────
+SPREAD_PCT_MAX      = 25.0            # max bid-ask spread % for a leg to be considered liquid
+
+# ── Search space (coord ascent cycles over these) ─────────────────────────────
+ALPHA_L_VALUES    = [ 0.90, 0.95, 1.00, 1.05, 1.10, 1.15,1.20,1.25]
+ALPHA_S1_VALUES   = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75]
+Q1_VALUES         = [1, 2, 3]
+BETA_VALUES       = [0.0, 0.25, 0.50, 0.75, 1.0]
+ETA_PCT_VALUES    = [-0.20, -0.15, -0.10, -0.05, 0.0, 0.05]
+DMIN_SHORT_VALUES = [ 14, 21,28,35]
+DMIN_LONG_VALUES  = [7, 14, 21]
+# T values come from the live chain — all liquid expiries are used
+
+# ── Coord-ascent parameters ───────────────────────────────────────────────────
+N_INIT            = 50               # random policies evaluated in Phase 1
+K_STARTS          = 15               # top Phase-1 seeds fed into Phase 2 coord ascent
+N_SEARCH          = 500              # paths for Phase 1+2 (CRN — same paths for all evals)
+N_FINE            = 2_000            # paths for Phase 3 fine verification
+MIN_P_SUCCESS     = 0.90             # minimum P_success to pass the fine filter
+
+# ══════════════════════════════════════════════════════════════════════════════
 
 
-def run_sanity_check(surface, spot, returns):
+def _push_config_to_policy_grid(chain: list[dict]) -> list[int]:
     """
-    Single-policy sanity check on 100 paths -- prints trace for first 3 paths.
-    Uses a near-ATM 270-day long put / 45-day 75%-OTM short put (N=1 structure).
-    The sanity policy is intentionally NOT self-funding (it starts with a debit)
-    so it exercises the roll mechanics in a realistic scenario.
+    Propagate all search-space lists from main.py into the policy_grid module.
+    T_L and T_S1 values come from ALL liquid chain expiries (no ordering constraint).
+    Returns the frozen_expiries list for use in the simulator's T-snap logic.
+    """
+    import pandas as pd
+    chain_df = pd.DataFrame(chain)
+    all_expiries = sorted(
+        chain_df[chain_df["spread_pct"] <= SPREAD_PCT_MAX]["days_out"].unique()
+    )
+
+    policy_grid.ALPHA_L_VALUES    = ALPHA_L_VALUES
+    policy_grid.ALPHA_S1_VALUES   = ALPHA_S1_VALUES
+    policy_grid.T_L_VALUES        = [int(d) for d in all_expiries]
+    policy_grid.T_S1_VALUES       = [int(d) for d in all_expiries]
+    policy_grid.Q1_VALUES         = Q1_VALUES
+    policy_grid.BETA_VALUES       = BETA_VALUES
+    policy_grid.ETA_PCT_VALUES    = ETA_PCT_VALUES
+    policy_grid.DMIN_SHORT_VALUES = DMIN_SHORT_VALUES
+    policy_grid.DMIN_LONG_VALUES  = DMIN_LONG_VALUES
+    policy_grid.SPREAD_PCT_MAX    = SPREAD_PCT_MAX
+
+    print(f"  Chain expiries (liquid, {len(all_expiries)} total): {all_expiries[:10]}...")
+    return [int(d) for d in all_expiries]
+
+
+def run_sanity_check(surface, spot: float, returns: np.ndarray) -> dict:
+    """
+    Single-policy sanity check on 100 paths with verbose trace.
+    Uses a near-ATM 282d long put / 37d 75%-OTM short put (beta=1 trailing HWM).
     """
     print("\n" + "=" * 60)
     print("SANITY CHECK -- single policy, 100 paths, verbose trace")
     print("=" * 60)
 
-    # Snap T values to nearest available chain expiries used by the grid
-    chain_days = sorted(set(r["days_out"] for r in surface._df.to_dict("records")))
-    def snap(target):
+    chain_days = sorted(surface._df["days_out"].unique())
+
+    def snap(target: int) -> int:
         return min(chain_days, key=lambda d: abs(d - target))
 
-    T_L_snap  = snap(270)
-    T_S1_snap = snap(45)
+    T_L_snap  = snap(282)
+    T_S1_snap = snap(37)
 
     test_policy = Policy(
-        alpha_L=0.97, alpha_S1=0.75, alpha_S2=0.0,
-        T_L=T_L_snap, T_S1=T_S1_snap, T_S2=0,
-        base_q1=1, base_q2=0,
-        gamma=0.0, d_min=14,
+        alpha_L=0.97, alpha_S1=0.75,
+        T_L=T_L_snap, T_S1=T_S1_snap,
+        base_q1=1, beta=1.0,
+        d_min_short=7, d_min_long=7,
+        eta_pct=0.0,
     )
-    print(f"  Test policy: alpha_L=0.97  alpha_S1=0.75  T_L={T_L_snap}d  T_S1={T_S1_snap}d")
 
     sampler   = BootstrapSampler(returns, seed=99)
-    paths_100 = sampler.sample_paths(100, HORIZON_DAYS, spot)
-
-    result = simulate_policy(
-        test_policy, paths_100, surface, spot, returns, verbose=True
+    paths_100 = sampler.sample_paths(
+        100, HORIZON_DAYS, spot, annual_default_prob=ANNUAL_DEFAULT_PROB
     )
 
-    print(f"\n-- Sanity result (100 paths) --")
+    result = simulate_policy(
+        test_policy, paths_100, surface, spot,
+        delta_floor=DELTA_FLOOR, cost_per_leg=COST_PER_LEG, verbose=True,
+    )
+
+    print(f"\n-- Sanity result (100 paths, seed=99) --")
     print(f"  P_success:    {result['P_success']*100:.1f}%")
     print(f"  E_W:         {result['E_W']:+.2f}")
     print(f"  CVaR_W:      {result['CVaR_W']:+.2f}")
     print(f"  P(W>0):       {result['P_W_positive']*100:.1f}%")
     print(f"  Mean rolls:   {result['n_rolls']:.1f}")
     print(f"  Breach depth: ${result['E_breach_depth']:.2f}")
-
+    print(f"  Score:        {result['P_success'] - result['E_breach_depth']/spot:+.4f}")
     return result
 
 
-def main():
+def main() -> None:
     refresh     = "--refresh" in sys.argv
     sanity_only = "--sanity"  in sys.argv
 
     # ── 1. Load data ──────────────────────────────────────────────────────────
     chain, spot, fetch_date = data_loader.load_option_chain("MSTR", refresh=refresh)
-    returns = data_loader.load_historical_returns("MSTR", refresh=refresh)
+    returns = data_loader.load_historical_returns(
+        "MSTR", refresh=refresh,
+        cutoff_date=BTC_ERA_CUTOFF if BTC_ERA_ONLY else None,
+    )
 
     # ── 2. Build frozen surface ───────────────────────────────────────────────
     print(f"\nBuilding frozen option surface ...")
     surface = build_surface(chain, spot)
     print(f"  Surface built from {len(chain)} contracts  (spot=${spot})")
 
-    # ── 3. Sanity check ───────────────────────────────────────────────────────
+    # ── 3. Push search space into policy_grid ─────────────────────────────────
+    print(f"\nConfiguring policy_grid search space ...")
+    frozen_expiries = _push_config_to_policy_grid(chain)
+
+    # ── 4. Sanity check ───────────────────────────────────────────────────────
     sanity = run_sanity_check(surface, spot, returns)
 
     if sanity_only:
         print("\n--sanity flag set. Exiting before full optimization.")
         return
 
-    # Abort if surface returns all-zeros (build failure)
     if sanity["E_W"] == 0.0 and sanity["n_rolls"] == 0.0:
-        print("\nERROR: Sanity check returned all-zero results. "
-              "Surface lookup may be broken. Aborting.")
+        print("\nERROR: Sanity check returned all-zero results. Surface lookup broken.")
         sys.exit(1)
 
-    # ── 4. Generate policy grid ───────────────────────────────────────────────
-    print(f"\nGenerating feasible policy grid  (eta=${ETA:.1f} initial debit allowed) ...")
-    feasible = policy_grid.generate(chain, spot, eta=ETA)
-
-    if not feasible:
-        print("No feasible policies found.")
-        print("  - Try --refresh to fetch a fresh option chain.")
-        print(f"  - Try increasing ETA (currently {ETA}) in main.py.")
-        sys.exit(1)
-
-    # ── 5. Pre-generate bootstrap paths ──────────────────────────────────────
+    # ── 5. Generate bootstrap paths ───────────────────────────────────────────
     print(f"\nGenerating bootstrap paths ...")
-    sampler      = BootstrapSampler(returns, seed=42)
-    paths_coarse = sampler.sample_paths(N_COARSE, HORIZON_COARSE, spot)
-    paths_fine   = sampler.sample_paths(N_FINE,   HORIZON_DAYS,   spot)
-    print(f"  Coarse : {paths_coarse.shape}  ({N_COARSE} paths x {HORIZON_COARSE} days)")
-    print(f"  Fine   : {paths_fine.shape}  ({N_FINE} paths x {HORIZON_DAYS} days)")
+    sampler_search = BootstrapSampler(returns, seed=42)
+    sampler_fine   = BootstrapSampler(returns, seed=137)
+    paths_search = sampler_search.sample_paths(
+        N_SEARCH, HORIZON_DAYS, spot, annual_default_prob=ANNUAL_DEFAULT_PROB
+    )
+    paths_fine = sampler_fine.sample_paths(
+        N_FINE, HORIZON_DAYS, spot, annual_default_prob=ANNUAL_DEFAULT_PROB
+    )
+    print(f"  Search : {paths_search.shape}  ({N_SEARCH} paths x {HORIZON_DAYS}d, seed=42)")
+    print(f"  Fine   : {paths_fine.shape}    ({N_FINE} paths x {HORIZON_DAYS}d, seed=137)")
+    print(f"  Crash overlay: ANNUAL_DEFAULT_PROB={ANNUAL_DEFAULT_PROB*100:.3f}%"
+          f"  (~{ANNUAL_DEFAULT_PROB*HORIZON_DAYS/252*100:.2f}% of fine paths crash)")
 
     # ── 6. Run optimization ───────────────────────────────────────────────────
     ranked = opt_module.run_optimization(
-        feasible_policies = feasible,
-        paths_coarse      = paths_coarse,
-        paths_fine        = paths_fine,
-        surface           = surface,
-        spot0             = spot,
-        returns           = returns,
+        surface          = surface,
+        spot0            = spot,
+        paths_search     = paths_search,
+        paths_fine       = paths_fine,
+        delta_floor      = DELTA_FLOOR,
+        cost_per_leg     = COST_PER_LEG,
+        n_init           = N_INIT,
+        k_starts         = K_STARTS,
+        min_p_success    = MIN_P_SUCCESS,
+        rng_seed         = 0,
+        frozen_expiries  = frozen_expiries,
     )
 
     # ── 7. Report ─────────────────────────────────────────────────────────────
-    results_module.report(ranked, spot)
+    results_module.report(ranked, spot, delta_floor=DELTA_FLOOR)
 
 
 if __name__ == "__main__":
