@@ -43,17 +43,19 @@ N_PATHS             = 2_000     # same as N_FINE in main.py
 SEED                = 137       # same as Phase-3 seed in main.py
 BLOCK_SIZE          = 10        # must match main.py BLOCK_SIZE
 
-# Best policy (v5 optimum — confirmed interior optimum across two grid searches)
+# Best policy — block bootstrap optimum (feature/block-bootstrap, block_size=10)
+# Key change vs v0.10: base_q1=0 (no short leg); pure rolling long put.
+# alpha_L=1.15 and T_L=34 are stable across both bootstrap methods.
 BEST = Policy(
     alpha_L     = 1.15,
-    alpha_S1    = 0.45,
+    alpha_S1    = 0.50,   # irrelevant (q1=0)
     T_L         = 34,
-    T_S1        = 467,
-    base_q1     = 1,
-    beta        = 0.5,
-    d_min_short = 35,
-    d_min_long  = 21,
-    eta_pct     = -0.15,
+    T_S1        = 69,     # irrelevant (q1=0)
+    base_q1     = 0,      # no short put
+    beta        = 0.25,
+    d_min_short = 60,     # irrelevant (q1=0)
+    d_min_long  = 28,
+    eta_pct     = -0.20,  # irrelevant (q1=0)
 )
 
 # Palette
