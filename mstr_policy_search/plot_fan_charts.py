@@ -41,6 +41,7 @@ HORIZON_DAYS        = 504
 COST_PER_LEG        = 1.0
 N_PATHS             = 2_000     # same as N_FINE in main.py
 SEED                = 137       # same as Phase-3 seed in main.py
+BLOCK_SIZE          = 10        # must match main.py BLOCK_SIZE
 
 # Best policy (v5 optimum — confirmed interior optimum across two grid searches)
 BEST = Policy(
@@ -253,8 +254,11 @@ def main():
     print(f"\nGenerating {N_PATHS:,} paths  (seed={SEED}) ...")
     sampler = BootstrapSampler(returns, seed=SEED)
     paths   = sampler.sample_paths(
-        N_PATHS, HORIZON_DAYS, spot0, annual_default_prob=ANNUAL_DEFAULT_PROB)
+        N_PATHS, HORIZON_DAYS, spot0, annual_default_prob=ANNUAL_DEFAULT_PROB,
+        block_size=BLOCK_SIZE)
     print(f"  Shape: {paths.shape}")
+    print(f"  Bootstrap: block_size={BLOCK_SIZE}  "
+          f"({'i.i.d.' if BLOCK_SIZE <= 1 else f'circular block, {BLOCK_SIZE}-day blocks'})")
 
     # ── simulate all three strategies ─────────────────────────────────────────
     print("\nSimulating buy-and-hold ...")

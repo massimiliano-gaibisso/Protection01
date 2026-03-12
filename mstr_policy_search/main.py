@@ -61,6 +61,12 @@ LAMBDA              = 1.0             # drag penalty in: score = CVaR_20_imp - L
 # ── Liquidity filter ──────────────────────────────────────────────────────────
 SPREAD_PCT_MAX      = 25.0            # max bid-ask spread % for a leg to be considered liquid
 
+# ── Bootstrap mode ────────────────────────────────────────────────────────────
+BLOCK_SIZE          = 10              # circular block bootstrap block size (trading days)
+                                      # 1  = i.i.d. (v0.10 baseline)
+                                      # 10 = 2-week blocks (preserves GARCH vol clustering)
+                                      # 21 = 1-month blocks
+
 # ── Search space (coord ascent cycles over these) ─────────────────────────────
 ALPHA_L_VALUES    = [  1.05, 1.10, 1.15,1.20,1.25]
 ALPHA_S1_VALUES   = [0.40, 0.45, 0.50, 0.55]
@@ -135,7 +141,8 @@ def run_sanity_check(surface, spot: float, returns: np.ndarray) -> dict:
 
     sampler   = BootstrapSampler(returns, seed=99)
     paths_100 = sampler.sample_paths(
-        100, HORIZON_DAYS, spot, annual_default_prob=ANNUAL_DEFAULT_PROB
+        100, HORIZON_DAYS, spot, annual_default_prob=ANNUAL_DEFAULT_PROB,
+        block_size=BLOCK_SIZE,
     )
 
     result = simulate_policy(
@@ -192,13 +199,17 @@ def main() -> None:
     sampler_search = BootstrapSampler(returns, seed=42)
     sampler_fine   = BootstrapSampler(returns, seed=137)
     paths_search = sampler_search.sample_paths(
-        N_SEARCH, HORIZON_DAYS, spot, annual_default_prob=ANNUAL_DEFAULT_PROB
+        N_SEARCH, HORIZON_DAYS, spot, annual_default_prob=ANNUAL_DEFAULT_PROB,
+        block_size=BLOCK_SIZE,
     )
     paths_fine = sampler_fine.sample_paths(
-        N_FINE, HORIZON_DAYS, spot, annual_default_prob=ANNUAL_DEFAULT_PROB
+        N_FINE, HORIZON_DAYS, spot, annual_default_prob=ANNUAL_DEFAULT_PROB,
+        block_size=BLOCK_SIZE,
     )
     print(f"  Search : {paths_search.shape}  ({N_SEARCH} paths x {HORIZON_DAYS}d, seed=42)")
     print(f"  Fine   : {paths_fine.shape}    ({N_FINE} paths x {HORIZON_DAYS}d, seed=137)")
+    print(f"  Bootstrap: block_size={BLOCK_SIZE}  "
+          f"({'i.i.d.' if BLOCK_SIZE <= 1 else f'circular block, {BLOCK_SIZE}-day blocks'})")
     print(f"  Crash overlay: ANNUAL_DEFAULT_PROB={ANNUAL_DEFAULT_PROB*100:.3f}%"
           f"  (~{ANNUAL_DEFAULT_PROB*HORIZON_DAYS/252*100:.2f}% of fine paths crash)")
 
