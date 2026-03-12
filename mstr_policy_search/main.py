@@ -62,13 +62,13 @@ LAMBDA              = 1.0             # drag penalty in: score = CVaR_20_imp - L
 SPREAD_PCT_MAX      = 25.0            # max bid-ask spread % for a leg to be considered liquid
 
 # ── Search space (coord ascent cycles over these) ─────────────────────────────
-ALPHA_L_VALUES    = [ 0.90, 0.95, 1.00, 1.05, 1.10, 1.15,1.20,1.25]
-ALPHA_S1_VALUES   = [0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75]
-Q1_VALUES         = [1, 2, 3]
+ALPHA_L_VALUES    = [  1.05, 1.10, 1.15,1.20,1.25]
+ALPHA_S1_VALUES   = [0.40, 0.45, 0.50, 0.55]
+Q1_VALUES         = [0, 1, 2]
 BETA_VALUES       = [0.0, 0.25, 0.50, 0.75, 1.0]
-ETA_PCT_VALUES    = [-0.20, -0.15, -0.10, -0.05, 0.0, 0.05]
-DMIN_SHORT_VALUES = [ 14, 21,28,35]
-DMIN_LONG_VALUES  = [7, 14, 21]
+ETA_PCT_VALUES    = [-0.20, -0.15, -0.10, -0.05]
+DMIN_SHORT_VALUES = [ 28,35,42,60,90]
+DMIN_LONG_VALUES  = [ 14, 21,28,35,42,60,90]
 # T values come from the live chain — all liquid expiries are used
 
 # ── Coord-ascent parameters ───────────────────────────────────────────────────
