@@ -25,7 +25,7 @@ from surface import build_surface
 from bootstrap import BootstrapSampler
 import policy_grid
 from policy_grid import Policy
-from simulator import simulate_policy
+from simulator import simulate_policy, simulate_stop_loss
 import optimizer as opt_module
 import results as results_module
 
@@ -54,6 +54,10 @@ ANNUAL_DEFAULT_PROB = 0.001           # 0.1% annual → ~0.20% of 504d paths cra
 # ── Transaction costs ─────────────────────────────────────────────────────────
 COST_PER_LEG        = 1.0             # $ per contract leg per roll
 
+# ── Score parameters ───────────────────────────────────────────────────────────
+LAMBDA              = 1.0             # drag penalty in: score = CVaR_20_imp - LAMBDA * E_drag
+                                      # 1.0 = equal dollar weight on crash improvement vs bull drag
+
 # ── Liquidity filter ──────────────────────────────────────────────────────────
 SPREAD_PCT_MAX      = 25.0            # max bid-ask spread % for a leg to be considered liquid
 
@@ -72,7 +76,7 @@ N_INIT            = 50               # random policies evaluated in Phase 1
 K_STARTS          = 15               # top Phase-1 seeds fed into Phase 2 coord ascent
 N_SEARCH          = 500              # paths for Phase 1+2 (CRN — same paths for all evals)
 N_FINE            = 2_000            # paths for Phase 3 fine verification
-MIN_P_SUCCESS     = 0.90             # minimum P_success to pass the fine filter
+MIN_P_SUCCESS     = 0.0              # 0.0 = no hard filter; score (CVaR_20_imp - E_drag) drives ranking
 
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -145,8 +149,10 @@ def run_sanity_check(surface, spot: float, returns: np.ndarray) -> dict:
     print(f"  CVaR_W:      {result['CVaR_W']:+.2f}")
     print(f"  P(W>0):       {result['P_W_positive']*100:.1f}%")
     print(f"  Mean rolls:   {result['n_rolls']:.1f}")
-    print(f"  Breach depth: ${result['E_breach_depth']:.2f}")
-    print(f"  Score:        {result['P_success'] - result['E_breach_depth']/spot:+.4f}")
+    print(f"  Breach depth: {result['E_breach_depth']:.2f}")
+    print(f"  CVaR_20_imp:  {result['CVaR_20_improvement']:+.2f}")
+    print(f"  E_drag:       {result['E_drag']:.2f}")
+    print(f"  Score:        {result['CVaR_20_improvement'] - LAMBDA * result['E_drag']:+.4f}")
     return result
 
 
@@ -204,6 +210,7 @@ def main() -> None:
         paths_fine       = paths_fine,
         delta_floor      = DELTA_FLOOR,
         cost_per_leg     = COST_PER_LEG,
+        lambda_          = LAMBDA,
         n_init           = N_INIT,
         k_starts         = K_STARTS,
         min_p_success    = MIN_P_SUCCESS,
@@ -211,8 +218,19 @@ def main() -> None:
         frozen_expiries  = frozen_expiries,
     )
 
-    # ── 7. Report ─────────────────────────────────────────────────────────────
-    results_module.report(ranked, spot, delta_floor=DELTA_FLOOR)
+    # ── 7. Benchmark: stop-loss on the same fine paths ────────────────────────
+    print(f"\nComputing stop-loss benchmark on {N_FINE:,} fine paths ...")
+    sl_metrics = simulate_stop_loss(paths_fine, spot, delta_floor=DELTA_FLOOR)
+    print(f"  Stop-loss: CVaR_20_imp={sl_metrics['CVaR_20_imp']:+.2f}  "
+          f"E_drag={sl_metrics['E_drag']:.2f}  "
+          f"E_imp={sl_metrics['E_improvement']:+.2f}  "
+          f"mean_trades={sl_metrics['n_trades']:.1f}")
+
+    benchmarks = {"stop_loss": sl_metrics}
+
+    # ── 8. Report ─────────────────────────────────────────────────────────────
+    results_module.report(ranked, spot, delta_floor=DELTA_FLOOR,
+                          lambda_=LAMBDA, benchmarks=benchmarks)
 
 
 if __name__ == "__main__":

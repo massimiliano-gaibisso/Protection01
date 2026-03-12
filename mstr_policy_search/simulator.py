@@ -17,6 +17,19 @@ v4 design vs v1:
       Long  roll:  receive bid_old_long  − pay ask_new_long   (net usually negative,
                    covers protection cost)
       Cost: cost_per_leg deducted per contract per side opened/closed
+
+Terminal improvement metrics (new in v5):
+  improvement(path) = W_final + Pi_T
+      where Pi_T = open option MTM at the terminal day using mid prices.
+      This is the net option P&L if everything is liquidated at horizon end.
+  Paths are sorted by terminal S_T (ascending = worst stock outcomes first).
+  CVaR_20_improvement : mean improvement in the bottom 20% of paths by S_T (crash paths).
+  E_drag              : mean of max(-improvement, 0) in the top 80% of paths (bull paths).
+  Score = CVaR_20_improvement - lambda * E_drag
+
+Stop-loss benchmark (simulate_stop_loss):
+  Zero-cost rule: sell stock when S_t < floor, buy back when S_t >= floor.
+  Returns the same terminal improvement metrics for direct comparison.
 """
 import numpy as np
 from policy_grid import Policy
@@ -229,7 +242,7 @@ def simulate_policy(
                             f"C_L={C_long[i]:+.2f}  K_L_new={K_L_new[i]:.2f}  W={W[p]:.2f}"
                         )
 
-    # ── aggregate metrics ─────────────────────────────────────────────────────
+    # ── aggregate legacy metrics ──────────────────────────────────────────────
     ever_breached    = breach.any(axis=1)
     P_success        = float((~ever_breached).mean())
     E_W              = float(W.mean())
@@ -241,12 +254,125 @@ def simulate_policy(
     n_breach_days  = int(breach_depth_cnt.sum())
     E_breach_depth = float(breach_depth_sum.sum() / n_breach_days) if n_breach_days > 0 else 0.0
 
+    # ── terminal open-option MTM (Pi_T) ───────────────────────────────────────
+    # Recompute Pi using final post-roll state so any roll on the last day is
+    # reflected.  This is the liquidation value of the open option positions
+    # at the horizon end.
+    T_S1_rem_T = policy.T_S1 - theta_short            # remaining days on short leg
+    T_L_vec_T  = np.clip(policy.T_L - theta_long, 1, policy.T_L)  # per-path long T_rem
+    T_S1_clamp = max(int(T_S1_rem_T), 1)
+
+    lp_T  = surface.price_vector(K_L,  T_L_vec_T,                       S[:, n_days], side="mid")
+    sp1_T = surface.price_vector(K_S1, np.full(n_paths, float(T_S1_clamp)), S[:, n_days], side="mid")
+    lp_T  = np.maximum(lp_T,  np.maximum(K_L  - S[:, n_days], 0.0))   # intrinsic floor
+    sp1_T = np.maximum(sp1_T, np.maximum(K_S1 - S[:, n_days], 0.0))
+    Pi_T  = lp_T - q1 * sp1_T                                           # (n_paths,)
+
+    # ── terminal improvement over buy-and-hold ────────────────────────────────
+    # improvement(path) = W_final + Pi_T
+    # Paths sorted ascending by S_T: bottom 20% = crash paths, top 80% = bull paths.
+    improvement = W + Pi_T
+    S_T         = S[:, n_days]
+    order_by_S  = np.argsort(S_T)
+    n_crash     = max(1, int(np.ceil(0.20 * n_paths)))
+    crash_idx   = order_by_S[:n_crash]
+    bull_idx    = order_by_S[n_crash:]
+
+    CVaR_20_improvement = float(improvement[crash_idx].mean())
+    E_drag = float(np.maximum(-improvement[bull_idx], 0).mean()) if len(bull_idx) > 0 else 0.0
+
     return {
-        "P_success":      P_success,
-        "E_W":            E_W,
-        "CVaR_W":         CVaR_W,
-        "P_W_positive":   P_W_positive,
-        "E_breach_depth": E_breach_depth,
-        "n_rolls":        float(roll_count.mean()),
-        "W_final":        W,          # kept for distribution output
+        # Legacy metrics (kept for reporting / diagnostics)
+        "P_success":            P_success,
+        "E_W":                  E_W,
+        "CVaR_W":               CVaR_W,
+        "P_W_positive":         P_W_positive,
+        "E_breach_depth":       E_breach_depth,
+        "n_rolls":              float(roll_count.mean()),
+        "W_final":              W,            # full distribution
+        # New terminal-improvement metrics (used in score)
+        "Pi_T":                 Pi_T,         # terminal open MTM (n_paths,)
+        "improvement":          improvement,  # W + Pi_T  (n_paths,)
+        "CVaR_20_improvement":  CVaR_20_improvement,
+        "E_drag":               E_drag,
+    }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  STOP-LOSS BENCHMARK
+# ──────────────────────────────────────────────────────────────────────────────
+
+def simulate_stop_loss(
+    paths:       np.ndarray,   # (n_paths, n_days+1) price paths
+    spot0:       float,
+    delta_floor: float = 0.80,
+    cvar_q:      float = 0.20,
+) -> dict:
+    """
+    Simulate the zero-cost stop-loss / re-entry benchmark.
+
+    Rule (checked every day):
+        - While in market: sell entire position when S_t < floor.
+        - While in cash:   buy back when S_t >= floor.
+        - floor = delta_floor × spot0  (fixed, identical to beta=0 options floor)
+
+    Each path starts holding 1 share worth spot0.  When the position is sold at
+    price S_sell, the cash S_sell is held.  When buying back at S_buy > S_sell
+    the investor can afford only S_sell / S_buy < 1 shares — the whipsaw penalty.
+
+    Returns dict with:
+        V_T              (n_paths,) terminal portfolio value
+        improvement      (n_paths,) V_T - S_T  (vs buy-and-hold)
+        CVaR_20_imp      mean improvement in bottom cvar_q% of paths by S_T
+        E_drag           mean of max(-improvement, 0) in top (1-cvar_q)% by S_T
+        E_improvement    unconditional mean improvement
+        n_trades         mean number of round-trip trades per path
+    """
+    n_paths, n_days_p1 = paths.shape
+    floor = delta_floor * spot0
+
+    shares    = np.ones(n_paths)              # start: 1 share per path
+    cash      = np.zeros(n_paths)
+    in_market = np.ones(n_paths, dtype=bool)
+    trade_cnt = np.zeros(n_paths, dtype=int)
+
+    for d in range(1, n_days_p1):
+        S_d = paths[:, d]
+
+        # Sell: in market AND price falls below floor
+        sell = in_market & (S_d < floor)
+        if sell.any():
+            cash[sell]      = shares[sell] * S_d[sell]
+            shares[sell]    = 0.0
+            in_market[sell] = False
+
+        # Buy back: in cash AND price recovers to or above floor
+        buy = (~in_market) & (S_d >= floor)
+        if buy.any():
+            shares[buy]    = cash[buy] / S_d[buy]  # fewer shares if bought back higher
+            cash[buy]      = 0.0
+            in_market[buy] = True
+            trade_cnt[buy] += 1                     # count completed round-trips
+
+    # Terminal wealth
+    S_T  = paths[:, -1]
+    V_T  = np.where(in_market, shares * S_T, cash)
+    improvement = V_T - S_T   # positive = better than buy-and-hold
+
+    # Split paths by terminal S_T (same ordering as simulate_policy)
+    order_by_S = np.argsort(S_T)
+    n_crash    = max(1, int(np.ceil(cvar_q * n_paths)))
+    crash_idx  = order_by_S[:n_crash]
+    bull_idx   = order_by_S[n_crash:]
+
+    CVaR_20_imp = float(improvement[crash_idx].mean())
+    E_drag      = float(np.maximum(-improvement[bull_idx], 0).mean()) if len(bull_idx) > 0 else 0.0
+
+    return {
+        "V_T":           V_T,
+        "improvement":   improvement,
+        "CVaR_20_imp":   CVaR_20_imp,
+        "E_drag":        E_drag,
+        "E_improvement": float(improvement.mean()),
+        "n_trades":      float(trade_cnt.mean()),
     }

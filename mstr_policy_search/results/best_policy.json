@@ -1,37 +1,32 @@
 {
   "policy": {
     "alpha_L": 1.15,
-    "alpha_S1": 0.4,
+    "alpha_S1": 0.45,
     "T_L": 34,
-    "T_S1": 1014,
+    "T_S1": 467,
     "base_q1": 1,
-    "beta": 0.0,
-    "d_min_short": 14,
-    "d_min_long": 14,
-    "eta_pct": -0.05
+    "beta": 0.5,
+    "d_min_short": 35,
+    "d_min_long": 21,
+    "eta_pct": -0.15
   },
   "strikes_at_current_spot": {
     "K_L": 153.56,
-    "K_S1": 53.41
+    "K_S1": 60.09
   },
   "metrics": {
-    "P_success": 0.9655,
-    "E_W": 80.2806,
-    "CVaR_W": -912.5584,
-    "P_W_positive": 0.776,
-    "E_breach_depth": 12.2581,
-    "n_rolls": 25.7,
-    "score": 0.8737
+    "P_success": 0.901,
+    "E_W": 206.5944,
+    "CVaR_W": -648.6255,
+    "P_W_positive": 0.8655,
+    "E_breach_depth": 18.1034,
+    "n_rolls": 39.0,
+    "CVaR_20_improvement": 172.7156,
+    "E_drag": 38.61,
+    "score": 134.1056
   },
   "optimizer_params": {
-    "delta_floor": 0.8
-  },
-  "analysis_params": {
-    "N_PATHS": 2000,
-    "HORIZON_DAYS": 504,
-    "DELTA_FLOOR": 0.8,
-    "ANNUAL_DEFAULT_PROB": 0.001,
-    "BTC_ERA": true,
-    "SEED": 42
+    "delta_floor": 0.8,
+    "lambda": 1.0
   }
 }

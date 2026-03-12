@@ -8,9 +8,17 @@ Phase 3 — Fine verify   : re-evaluate the top local optima on 2,000 fine paths
 CRN: Phases 1 and 2 use the SAME pre-generated search paths so that path noise
 cancels in pairwise score comparisons (variance reduction).
 
-Score: P_success − E_breach_depth / spot
-  → maximising this prioritises breach protection above all else.
-  → no income bias: E_W is not in the objective.
+Score (v5 — terminal improvement):
+  score = CVaR_20_improvement  −  lambda * E_drag
+    CVaR_20_improvement : mean(W_final + Pi_T) over the 20% of paths with
+                          the worst terminal stock price S_T  (crash paths).
+    E_drag              : mean(max(-(W_final + Pi_T), 0)) over the top 80%
+                          of paths by S_T  (bull paths).
+    lambda              : penalty weight on bull-path drag (default 1.0).
+
+  This directly measures how much the options overlay improves the terminal
+  P&L distribution relative to buy-and-hold, penalising cost drag in good
+  scenarios.  No hard P_success filter is applied (set min_p_success=0.0).
 """
 import numpy as np
 from tqdm import tqdm
@@ -20,8 +28,13 @@ from surface import FrozenSurface
 from simulator import simulate_policy
 
 
-def _score(m: dict, spot: float) -> float:
-    return m["P_success"] - m["E_breach_depth"] / spot
+def _score(m: dict, lambda_: float = 1.0) -> float:
+    """
+    Terminal-improvement score.
+    score = CVaR_20_improvement  -  lambda_ * E_drag
+    Both quantities are computed inside simulate_policy() by sorting paths on S_T.
+    """
+    return m["CVaR_20_improvement"] - lambda_ * m["E_drag"]
 
 
 def _evaluate(
@@ -32,12 +45,13 @@ def _evaluate(
     delta_floor:     float,
     cost_per_leg:    float,
     frozen_expiries: list | None = None,
+    lambda_:         float = 1.0,
 ) -> float:
     try:
         m = simulate_policy(policy, paths, surface, spot0,
                             delta_floor=delta_floor, cost_per_leg=cost_per_leg,
                             frozen_expiries=frozen_expiries)
-        return _score(m, spot0)
+        return _score(m, lambda_=lambda_)
     except Exception:
         return -1e9
 
@@ -51,6 +65,7 @@ def _coord_ascent(
     cost_per_leg:    float,
     frozen_expiries: list | None = None,
     rng:             np.random.Generator | None = None,
+    lambda_:         float = 1.0,
 ) -> tuple:
     """
     Single-start coordinate ascent.  Cycles through all params until no improvement.
@@ -60,7 +75,7 @@ def _coord_ascent(
     """
     current       = seed
     current_score = _evaluate(current, paths, surface, spot0, delta_floor, cost_per_leg,
-                              frozen_expiries=frozen_expiries)
+                              frozen_expiries=frozen_expiries, lambda_=lambda_)
 
     improved = True
     while improved:
@@ -75,7 +90,7 @@ def _coord_ascent(
                 if not pg.is_feasible(neighbor, spot0, surface):
                     continue
                 s = _evaluate(neighbor, paths, surface, spot0, delta_floor, cost_per_leg,
-                              frozen_expiries=frozen_expiries)
+                              frozen_expiries=frozen_expiries, lambda_=lambda_)
                 if s > best_score + 1e-6:
                     best_score    = s
                     best_neighbor = neighbor
@@ -94,16 +109,18 @@ def run_optimization(
     paths_fine:      np.ndarray,    # (N_FINE,   H+1)  fresh paths for phase 3
     delta_floor:     float = 0.80,
     cost_per_leg:    float = 1.0,
+    lambda_:         float = 1.0,   # drag penalty weight in score
     n_init:          int   = 50,    # random policies in Phase 1
     k_starts:        int   = 15,    # best seeds for Phase 2 coord ascent
-    min_p_success:   float = 0.90,  # Phase 3 filter threshold
+    min_p_success:   float = 0.0,   # Phase 3 filter (0.0 = no filter; score drives ranking)
     rng_seed:        int   = 0,
     frozen_expiries: list | None = None,
 ) -> list[dict]:
     """
     Returns list of result dicts sorted by score (best first).
     Each dict: policy, P_success, E_W, CVaR_W, P_W_positive,
-               E_breach_depth, n_rolls, W_final, score.
+               E_breach_depth, n_rolls, W_final,
+               CVaR_20_improvement, E_drag, score.
     """
     rng = np.random.default_rng(rng_seed)
 
@@ -121,19 +138,17 @@ def run_optimization(
         else:
             continue
         s = _evaluate(p, paths_search, surface, spot0, delta_floor, cost_per_leg,
-                      frozen_expiries=frozen_expiries)
+                      frozen_expiries=frozen_expiries, lambda_=lambda_)
         phase1.append((p, s))
 
     phase1.sort(key=lambda x: x[1], reverse=True)
-    best_p1_score, best_p1_ps = phase1[0][1], 0.0
     if phase1:
         m0 = simulate_policy(phase1[0][0], paths_search, surface, spot0, delta_floor, cost_per_leg,
                              frozen_expiries=frozen_expiries)
-        best_p1_ps = m0["P_success"]
-        best_p1_breach = m0["E_breach_depth"]
     print(f"Phase 1 complete: {len(phase1)} evaluated  -> top {k_starts} seeds for Phase 2")
     print(f"  Best Phase-1 score: {phase1[0][1]:+.4f}  "
-          f"(P_success={best_p1_ps*100:.1f}%  E_breach=${best_p1_breach:.2f})")
+          f"(CVaR_20={m0['CVaR_20_improvement']:+.2f}  E_drag={m0['E_drag']:.2f}  "
+          f"P_success={m0['P_success']*100:.1f}%)")
 
     seeds = [p for p, _ in phase1[:k_starts]]
 
@@ -147,7 +162,8 @@ def run_optimization(
         local_opt, local_score = _coord_ascent(
             seed, paths_search, surface, spot0, delta_floor, cost_per_leg,
             frozen_expiries=frozen_expiries,
-            rng=rng,                            # shared rng → shuffled coord order each pass
+            rng=rng,
+            lambda_=lambda_,
         )
         phase2.append((local_opt, local_score))
 
@@ -164,7 +180,8 @@ def run_optimization(
                          frozen_expiries=frozen_expiries)
     print(f"Phase 2 complete: {len(unique)} unique local optima  -> top {len(phase2_top)} for Phase 3")
     print(f"  Best Phase-2 score: {phase2_top[0][1]:+.4f}  "
-          f"(P_success={m2['P_success']*100:.1f}%  E_breach=${m2['E_breach_depth']:.2f})")
+          f"(CVaR_20={m2['CVaR_20_improvement']:+.2f}  E_drag={m2['E_drag']:.2f}  "
+          f"P_success={m2['P_success']*100:.1f}%)")
 
     # ── Phase 3: Fine verification ────────────────────────────────────────────
     print(f"\n{'─'*62}")
@@ -178,23 +195,28 @@ def run_optimization(
         m = simulate_policy(p, paths_fine, surface, spot0, delta_floor, cost_per_leg,
                             frozen_expiries=frozen_expiries)
         fine_results.append({
-            "policy":          p,
-            "P_success":       m["P_success"],
-            "E_W":             m["E_W"],
-            "CVaR_W":          m["CVaR_W"],
-            "P_W_positive":    m["P_W_positive"],
-            "E_breach_depth":  m["E_breach_depth"],
-            "n_rolls":         m["n_rolls"],
-            "W_final":         m["W_final"],
-            "score":           _score(m, spot0),
+            "policy":               p,
+            "P_success":            m["P_success"],
+            "E_W":                  m["E_W"],
+            "CVaR_W":               m["CVaR_W"],
+            "P_W_positive":         m["P_W_positive"],
+            "E_breach_depth":       m["E_breach_depth"],
+            "n_rolls":              m["n_rolls"],
+            "W_final":              m["W_final"],
+            "improvement":          m["improvement"],
+            "CVaR_20_improvement":  m["CVaR_20_improvement"],
+            "E_drag":               m["E_drag"],
+            "score":                _score(m, lambda_=lambda_),
         })
 
+    # Filter (default min_p_success=0.0 means no filter — score drives ranking)
     valid = [r for r in fine_results if r["P_success"] >= min_p_success]
     valid.sort(key=lambda r: r["score"], reverse=True)
 
     n_valid = len(valid)
+    filter_str = f">= {min_p_success:.0%}" if min_p_success > 0 else "no filter"
     print(f"Phase 3 complete: {len(fine_results)} evaluated  -> "
-          f"{n_valid} meet P_success >= {min_p_success:.0%}")
+          f"{n_valid} returned  ({filter_str})")
 
     if not valid:
         print("WARNING: No policies met fine threshold. Returning all by score.")
