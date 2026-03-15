@@ -46,11 +46,12 @@ def _evaluate(
     cost_per_leg:    float,
     frozen_expiries: list | None = None,
     lambda_:         float = 1.0,
+    sim_kwargs:      dict  = {},
 ) -> float:
     try:
         m = simulate_policy(policy, paths, surface, spot0,
                             delta_floor=delta_floor, cost_per_leg=cost_per_leg,
-                            frozen_expiries=frozen_expiries)
+                            frozen_expiries=frozen_expiries, **sim_kwargs)
         return _score(m, lambda_=lambda_)
     except Exception:
         return -1e9
@@ -66,6 +67,7 @@ def _coord_ascent(
     frozen_expiries: list | None = None,
     rng:             np.random.Generator | None = None,
     lambda_:         float = 1.0,
+    sim_kwargs:      dict  = {},
 ) -> tuple:
     """
     Single-start coordinate ascent.  Cycles through all params until no improvement.
@@ -75,7 +77,8 @@ def _coord_ascent(
     """
     current       = seed
     current_score = _evaluate(current, paths, surface, spot0, delta_floor, cost_per_leg,
-                              frozen_expiries=frozen_expiries, lambda_=lambda_)
+                              frozen_expiries=frozen_expiries, lambda_=lambda_,
+                              sim_kwargs=sim_kwargs)
 
     improved = True
     while improved:
@@ -90,7 +93,8 @@ def _coord_ascent(
                 if not pg.is_feasible(neighbor, spot0, surface):
                     continue
                 s = _evaluate(neighbor, paths, surface, spot0, delta_floor, cost_per_leg,
-                              frozen_expiries=frozen_expiries, lambda_=lambda_)
+                              frozen_expiries=frozen_expiries, lambda_=lambda_,
+                              sim_kwargs=sim_kwargs)
                 if s > best_score + 1e-6:
                     best_score    = s
                     best_neighbor = neighbor
@@ -115,6 +119,7 @@ def run_optimization(
     min_p_success:   float = 0.0,   # Phase 3 filter (0.0 = no filter; score drives ranking)
     rng_seed:        int   = 0,
     frozen_expiries: list | None = None,
+    sim_kwargs:      dict  = {},    # extra kwargs forwarded to simulate_policy (e.g. rvol_base, vol_scale_roll)
 ) -> list[dict]:
     """
     Returns list of result dicts sorted by score (best first).
@@ -138,13 +143,13 @@ def run_optimization(
         else:
             continue
         s = _evaluate(p, paths_search, surface, spot0, delta_floor, cost_per_leg,
-                      frozen_expiries=frozen_expiries, lambda_=lambda_)
+                      frozen_expiries=frozen_expiries, lambda_=lambda_, sim_kwargs=sim_kwargs)
         phase1.append((p, s))
 
     phase1.sort(key=lambda x: x[1], reverse=True)
     if phase1:
         m0 = simulate_policy(phase1[0][0], paths_search, surface, spot0, delta_floor, cost_per_leg,
-                             frozen_expiries=frozen_expiries)
+                             frozen_expiries=frozen_expiries, **sim_kwargs)
     print(f"Phase 1 complete: {len(phase1)} evaluated  -> top {k_starts} seeds for Phase 2")
     print(f"  Best Phase-1 score: {phase1[0][1]:+.4f}  "
           f"(CVaR_20={m0['CVaR_20_improvement']:+.2f}  E_drag={m0['E_drag']:.2f}  "
@@ -164,6 +169,7 @@ def run_optimization(
             frozen_expiries=frozen_expiries,
             rng=rng,
             lambda_=lambda_,
+            sim_kwargs=sim_kwargs,
         )
         phase2.append((local_opt, local_score))
 
@@ -177,7 +183,7 @@ def run_optimization(
 
     phase2_top = unique[:k_starts]
     m2 = simulate_policy(phase2_top[0][0], paths_search, surface, spot0, delta_floor, cost_per_leg,
-                         frozen_expiries=frozen_expiries)
+                         frozen_expiries=frozen_expiries, **sim_kwargs)
     print(f"Phase 2 complete: {len(unique)} unique local optima  -> top {len(phase2_top)} for Phase 3")
     print(f"  Best Phase-2 score: {phase2_top[0][1]:+.4f}  "
           f"(CVaR_20={m2['CVaR_20_improvement']:+.2f}  E_drag={m2['E_drag']:.2f}  "
@@ -193,7 +199,7 @@ def run_optimization(
     fine_results: list[dict] = []
     for p, _ in tqdm(phase2_top, desc="Phase 3", unit="policy"):
         m = simulate_policy(p, paths_fine, surface, spot0, delta_floor, cost_per_leg,
-                            frozen_expiries=frozen_expiries)
+                            frozen_expiries=frozen_expiries, **sim_kwargs)
         fine_results.append({
             "policy":               p,
             "P_success":            m["P_success"],

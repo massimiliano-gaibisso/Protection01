@@ -34,6 +34,120 @@ Stop-loss benchmark (simulate_stop_loss):
 import numpy as np
 from policy_grid import Policy
 from surface import FrozenSurface
+from bs_pricer import bs_put_vec
+
+
+# ── Rolling realized-vol helper ────────────────────────────────────────────────
+
+def _rolling_std_21(log_r: np.ndarray, rvol_base: float) -> np.ndarray:
+    """
+    Vectorised 21-day rolling std of log_r (n_paths, n_days).
+
+    Uses the cumsum-of-squares identity — no Python loops.
+    Days 0..19 lack sufficient history and are filled with rvol_base.
+    Returns array of shape (n_paths, n_days).
+    """
+    n_paths, n_days = log_r.shape
+    WINDOW = 21
+    rvol   = np.full((n_paths, n_days), rvol_base)
+    if n_days < WINDOW:
+        return rvol
+
+    cs  = np.cumsum(np.pad(log_r,        ((0, 0), (1, 0))), axis=1)
+    cs2 = np.cumsum(np.pad(log_r ** 2,   ((0, 0), (1, 0))), axis=1)
+
+    d_arr = np.arange(WINDOW - 1, n_days)
+    s     = cs[:,  d_arr + 1] - cs[:,  d_arr + 1 - WINDOW]
+    s2    = cs2[:, d_arr + 1] - cs2[:, d_arr + 1 - WINDOW]
+    var   = s2 / WINDOW - (s / WINDOW) ** 2
+    rvol[:, WINDOW - 1:] = np.sqrt(np.maximum(var, 1e-12))
+    return rvol
+
+
+def _roll_price_vs(
+    surface:   FrozenSurface,
+    K_vec:     np.ndarray,
+    T_vec:     np.ndarray,
+    S_vec:     np.ndarray,
+    vol_scale: np.ndarray,
+    side:      str,
+) -> np.ndarray:
+    """
+    Vol-scaled option price for a batch of roll-event paths.
+
+    1. Fetch frozen mid IV at (K, T, S) from the IV interpolator.
+    2. Scale IV by vol_scale (realized-vol / base-vol ratio, clipped [0.25, 4.0]).
+    3. Price via Black-Scholes at the scaled IV (mid price).
+    4. Restore frozen bid/ask spread ratio so bid/ask pricing is preserved.
+
+    Falls back to the frozen price surface if IV surface is unavailable.
+    """
+    if not surface._has_iv_surface:
+        return surface.price_vector(K_vec, T_vec, S_vec, side=side)
+
+    iv_scaled  = surface.iv_vector(K_vec, T_vec, S_vec) * vol_scale
+    p_mid_vs   = bs_put_vec(S_vec, K_vec, T_vec / 252.0, iv_scaled)
+
+    p_frz_mid  = surface.price_vector(K_vec, T_vec, S_vec, side="mid")
+    p_frz_side = surface.price_vector(K_vec, T_vec, S_vec, side=side)
+    ratio      = np.where(p_frz_mid > 1e-6, p_frz_side / p_frz_mid, 1.0)
+    return p_mid_vs * ratio
+
+
+def _roll_price_div(
+    surface:  FrozenSurface,
+    K_vec:    np.ndarray,
+    T_vec:    np.ndarray,   # days remaining (not years)
+    S_vec:    np.ndarray,
+    spot0:    float,        # S0 at simulation start — log(S_t/S0) is the leverage anchor
+    iv_beta:  float,        # leverage coefficient; negative = vol rises when S falls
+    side:     str,
+) -> np.ndarray:
+    """
+    Dynamic-IV put pricing via the leverage-effect formula:
+
+        IV(K, T, t) = IV_initial(K/S_t, T) + iv_beta * log(S_t / S0)
+
+    where IV_initial is read from the frozen chain IV surface at the current
+    moneyness K/S_t and tenor T (same grid as the frozen price surface).
+
+    Economic interpretation:
+      iv_beta < 0  ->  IV rises in crashes (S_t < S0), falls in rallies.
+                       Puts become cheaper in bull runs and more expensive
+                       in crashes — consistent with the leverage / vol-feedback
+                       effect observed in equity markets.
+      iv_beta = 0  ->  reduces to the frozen surface mid price (via BS).
+
+    Bid/ask spread: the dynamic BS mid is scaled by the frozen surface's
+    bid/ask-to-mid ratio, preserving realistic transaction costs.
+
+    Falls back to the frozen price surface if no IV surface is available.
+    """
+    if not surface._has_iv_surface:
+        return surface.price_vector(K_vec, T_vec, S_vec, side=side)
+
+    if np.isscalar(T_vec):
+        T_vec = np.full_like(K_vec, float(T_vec), dtype=float)
+    T_vec = np.asarray(T_vec, dtype=float)
+
+    # IV_initial at current moneyness K/S_t (same convention as iv_vector)
+    iv_init   = surface.iv_vector(K_vec, T_vec, S_vec)
+
+    # Leverage adjustment: log(S_t/S0); clip S_vec to avoid log(0) in crash paths
+    log_ratio = np.log(np.maximum(S_vec, 1e-6) / spot0)
+    iv_adj    = np.clip(iv_init + iv_beta * log_ratio, 0.05, 5.0)
+
+    # BS mid price at adjusted IV
+    p_mid = bs_put_vec(S_vec, K_vec, T_vec / 252.0, iv_adj)
+
+    if side == "mid":
+        return p_mid
+
+    # Scale by frozen bid/ask ratio to preserve market spread
+    p_frz_mid  = surface.price_vector(K_vec, T_vec, S_vec, side="mid")
+    p_frz_side = surface.price_vector(K_vec, T_vec, S_vec, side=side)
+    ratio      = np.where(p_frz_mid > 1e-6, p_frz_side / p_frz_mid, 1.0)
+    return np.maximum(p_mid * ratio, 0.0)
 
 
 def _inception_cash_flow(
@@ -61,9 +175,11 @@ def simulate_policy(
     delta_floor:     float = 0.80,    # floor fraction
     cost_per_leg:    float = 1.0,     # $ per contract leg per roll side
     verbose:         bool  = False,   # print trace for first 3 paths (days 1-60)
-    frozen_expiries: list | None = None,  # chain days_out grid; if given, T_L and T_S1
-                                          # are snapped to nearest listed expiry so roll
-                                          # pricing always hits an exact surface grid point
+    frozen_expiries: list | None = None,
+    rvol_base:       float | None = None,  # trailing 21-day realized vol at chain date
+    vol_scale_roll:  bool  = False,        # True → vol-scaled BS at roll pricing
+    use_dynamic_iv:  bool  = False,        # True → dynamic-IV BS pricing (leverage effect)
+    iv_beta:         float = -1.0,         # leverage coefficient for dynamic IV
 ) -> dict:
     """
     Simulate policy across all paths.  Returns performance metrics dict.
@@ -112,6 +228,16 @@ def simulate_policy(
     breach_depth_cnt = np.zeros(n_paths, dtype=int)
     roll_count       = np.zeros(n_paths, dtype=int)
 
+    # ── Pre-compute 21-day rolling realized vol (for vol-scaled roll pricing) ──
+    _use_vs = vol_scale_roll and (rvol_base is not None) and (rvol_base > 0)
+    if _use_vs:
+        _log_r    = np.log(np.maximum(S[:, 1:], 1e-6) / np.maximum(S[:, :-1], 1e-6))
+        _rvol_21d = _rolling_std_21(_log_r, rvol_base)   # (n_paths, n_days)
+
+    # ── Dynamic-IV pricing flag (mutually exclusive with vol-scaled) ──────────
+    # _use_div=True → _roll_price_div() at every pricing point (rolls + Pi MTM)
+    _use_div = use_dynamic_iv and (not _use_vs) and surface._has_iv_surface
+
     if verbose:
         print(f"\n=== POLICY TRACE (first 3 paths, days 1-60) ===")
         print(f"  Policy: alpha_L={policy.alpha_L}  alpha_S1={policy.alpha_S1}  "
@@ -123,6 +249,10 @@ def simulate_policy(
         short_bid = surface.price(spot0*policy.alpha_S1, policy.T_S1, spot0, side="bid") or 0.0
         print(f"  Inception: long_ask={long_ask:.2f}  short_bid={short_bid:.2f}  "
               f"net_W={ic:.2f}  K_L={spot0*policy.alpha_L:.2f}  K_S1={spot0*policy.alpha_S1:.2f}")
+        if _use_vs:
+            print(f"  Vol-scaled roll pricing ON  rvol_base={rvol_base*100:.3f}%/day")
+        if _use_div:
+            print(f"  Dynamic-IV roll pricing ON  iv_beta={iv_beta:.2f}")
 
     # ── main day loop ─────────────────────────────────────────────────────────
     for d in range(1, n_days + 1):
@@ -138,8 +268,15 @@ def simulate_policy(
         T_L_vec  = np.clip(T_L_rem, 1, policy.T_L)
         T_S1_vec = max(T_S1_rem, 1)                # scalar; shared across paths
 
-        lp_val  = surface.price_vector(K_L,  T_L_vec,           S[:, d], side="mid")
-        sp1_val = surface.price_vector(K_S1, np.full(n_paths, float(T_S1_vec)), S[:, d], side="mid")
+        if _use_div:
+            lp_val  = _roll_price_div(surface, K_L, T_L_vec,
+                                      S[:, d], spot0, iv_beta, "mid")
+            sp1_val = _roll_price_div(surface, K_S1,
+                                      np.full(n_paths, float(T_S1_vec)),
+                                      S[:, d], spot0, iv_beta, "mid")
+        else:
+            lp_val  = surface.price_vector(K_L,  T_L_vec,           S[:, d], side="mid")
+            sp1_val = surface.price_vector(K_S1, np.full(n_paths, float(T_S1_vec)), S[:, d], side="mid")
         # Intrinsic safety-floor: surface already scales with S (homogeneity fix),
         # but grid-edge clipping can still underestimate deep-ITM puts in extreme crashes.
         lp_val  = np.maximum(lp_val,  np.maximum(K_L  - S[:, d], 0.0))
@@ -184,18 +321,30 @@ def simulate_policy(
 
         # ── execute short roll (all paths) ────────────────────────────────────
         if R_short:
-            T_S1_q = max(T_S1_rem, 1)
+            T_S1_q   = max(T_S1_rem, 1)
+            T_S1_arr = np.full(n_paths, float(T_S1_q))
+            K_S1_new = S[:, d] * policy.alpha_S1
 
-            sp1_ask_close = surface.price_vector(
-                K_S1, np.full(n_paths, float(T_S1_q)), S[:, d], side="ask"
-            )
-            sp1_ask_close = np.maximum(sp1_ask_close, np.maximum(K_S1 - S[:, d], 0.0))  # intrinsic safety-floor
+            if _use_vs:
+                _vs = np.clip(_rvol_21d[:, d - 1] / rvol_base, 0.25, 4.0)
+                sp1_ask_close = _roll_price_vs(surface, K_S1, T_S1_arr, S[:, d], _vs, "ask")
+                T_S1_new_arr  = np.full(n_paths, float(policy.T_S1))
+                sp1_bid_new   = _roll_price_vs(surface, K_S1_new, T_S1_new_arr, S[:, d], _vs, "bid")
+            elif _use_div:
+                sp1_ask_close = _roll_price_div(surface, K_S1, T_S1_arr,
+                                                S[:, d], spot0, iv_beta, "ask")
+                sp1_bid_new   = _roll_price_div(surface, K_S1_new,
+                                                np.full(n_paths, float(policy.T_S1)),
+                                                S[:, d], spot0, iv_beta, "bid")
+            else:
+                sp1_ask_close = surface.price_vector(K_S1, T_S1_arr, S[:, d], side="ask")
+                sp1_bid_new   = surface.price_vector(
+                    K_S1_new, np.full(n_paths, float(policy.T_S1)), S[:, d], side="bid"
+                )
 
-            K_S1_new  = S[:, d] * policy.alpha_S1
-            sp1_bid_new = surface.price_vector(
-                K_S1_new, np.full(n_paths, float(policy.T_S1)), S[:, d], side="bid"
-            )
-            # Net per path: receive new_bid, pay close_ask, deduct 2 legs per contract
+            sp1_ask_close = np.maximum(sp1_ask_close, np.maximum(K_S1     - S[:, d], 0.0))
+            sp1_bid_new   = np.maximum(sp1_bid_new,   np.maximum(K_S1_new - S[:, d], 0.0))
+
             C_short = q1 * (sp1_bid_new - sp1_ask_close) - 2.0 * q1 * cost_per_leg
             W    += C_short
             K_S1  = K_S1_new
@@ -214,16 +363,26 @@ def simulate_policy(
         if R_long.any():
             idx = np.where(R_long)[0]
             S_r = S[idx, d]
-            T_L_q = np.clip(T_L_rem[idx], 1, policy.T_L)
+            T_L_q = np.clip(T_L_rem[idx], 1, policy.T_L).astype(float)
 
-            lp_bid_close = surface.price_vector(K_L[idx], T_L_q, S_r, side="bid")
-            lp_bid_close = np.maximum(lp_bid_close, np.maximum(K_L[idx] - S_r, 0.0))  # intrinsic safety-floor
+            K_L_new   = S_r * policy.alpha_L
+            T_L_full  = np.full(len(idx), float(policy.T_L))
 
-            K_L_new    = S_r * policy.alpha_L
-            lp_ask_new = surface.price_vector(
-                K_L_new, np.full(len(idx), float(policy.T_L)), S_r, side="ask"
-            )
-            lp_ask_new = np.maximum(lp_ask_new, np.maximum(K_L_new - S_r, 0.0))  # intrinsic safety-floor
+            if _use_vs:
+                _vs_idx      = np.clip(_rvol_21d[idx, d - 1] / rvol_base, 0.25, 4.0)
+                lp_bid_close = _roll_price_vs(surface, K_L[idx], T_L_q,    S_r, _vs_idx, "bid")
+                lp_ask_new   = _roll_price_vs(surface, K_L_new,  T_L_full, S_r, _vs_idx, "ask")
+            elif _use_div:
+                lp_bid_close = _roll_price_div(surface, K_L[idx], T_L_q,
+                                               S_r, spot0, iv_beta, "bid")
+                lp_ask_new   = _roll_price_div(surface, K_L_new, T_L_full,
+                                               S_r, spot0, iv_beta, "ask")
+            else:
+                lp_bid_close = surface.price_vector(K_L[idx], T_L_q,    S_r, side="bid")
+                lp_ask_new   = surface.price_vector(K_L_new,  T_L_full, S_r, side="ask")
+
+            lp_bid_close = np.maximum(lp_bid_close, np.maximum(K_L[idx]  - S_r, 0.0))  # intrinsic safety-floor
+            lp_ask_new   = np.maximum(lp_ask_new,   np.maximum(K_L_new   - S_r, 0.0))  # intrinsic safety-floor
 
             # Net per path: receive old_bid, pay new_ask, deduct 2 legs
             C_long = lp_bid_close - lp_ask_new - 2.0 * cost_per_leg
@@ -262,8 +421,27 @@ def simulate_policy(
     T_L_vec_T  = np.clip(policy.T_L - theta_long, 1, policy.T_L)  # per-path long T_rem
     T_S1_clamp = max(int(T_S1_rem_T), 1)
 
-    lp_T  = surface.price_vector(K_L,  T_L_vec_T,                       S[:, n_days], side="mid")
-    sp1_T = surface.price_vector(K_S1, np.full(n_paths, float(T_S1_clamp)), S[:, n_days], side="mid")
+    # Pi_T: use vol-scaled BS if vol-scaling is active, so Pi_T is consistent
+    # with W (which already captured vol spikes at each roll event).
+    # In crash paths the elevated terminal rvol_21d boosts lp_T, giving a more
+    # accurate CVaR_20_improvement.  intrinsic floor applied after either branch.
+    if _use_vs:
+        _vs_T = np.clip(_rvol_21d[:, n_days - 1] / rvol_base, 0.25, 4.0)
+        lp_T  = _roll_price_vs(surface, K_L,
+                               T_L_vec_T.astype(float),
+                               S[:, n_days], _vs_T, "mid")
+        sp1_T = _roll_price_vs(surface, K_S1,
+                               np.full(n_paths, float(T_S1_clamp)),
+                               S[:, n_days], _vs_T, "mid")
+    elif _use_div:
+        lp_T  = _roll_price_div(surface, K_L, T_L_vec_T.astype(float),
+                                S[:, n_days], spot0, iv_beta, "mid")
+        sp1_T = _roll_price_div(surface, K_S1,
+                                np.full(n_paths, float(T_S1_clamp)),
+                                S[:, n_days], spot0, iv_beta, "mid")
+    else:
+        lp_T  = surface.price_vector(K_L,  T_L_vec_T,                           S[:, n_days], side="mid")
+        sp1_T = surface.price_vector(K_S1, np.full(n_paths, float(T_S1_clamp)), S[:, n_days], side="mid")
     lp_T  = np.maximum(lp_T,  np.maximum(K_L  - S[:, n_days], 0.0))   # intrinsic floor
     sp1_T = np.maximum(sp1_T, np.maximum(K_S1 - S[:, n_days], 0.0))
     Pi_T  = lp_T - q1 * sp1_T                                           # (n_paths,)

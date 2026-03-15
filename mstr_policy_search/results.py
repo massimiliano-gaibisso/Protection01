@@ -17,6 +17,7 @@ def report(
     delta_floor: float = 0.80,
     lambda_:    float  = 1.0,
     benchmarks: dict   = None,   # optional dict with stop-loss and BH metrics
+    tag:        str    = "",     # appended to saved filenames (e.g. "_drift_-0.10pct")
 ) -> None:
     """Print top-10 table, best policy detail, benchmark comparison; save files."""
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -148,14 +149,14 @@ def report(
     print("=" * 60)
 
     # ── Save files ────────────────────────────────────────────────────────────
-    _save_top_policies_csv(ranked, spot)
-    _save_best_policy_json(best, spot, delta_floor, lambda_)
-    _save_terminal_distributions(best, benchmarks)
-    print(f"\nResults saved to {RESULTS_DIR}/")
+    _save_top_policies_csv(ranked, spot, tag)
+    _save_best_policy_json(best, spot, delta_floor, lambda_, tag)
+    _save_terminal_distributions(best, benchmarks, tag)
+    print(f"\nResults saved to {RESULTS_DIR}/ (tag='{tag}')")
 
 
-def _save_top_policies_csv(ranked: list[dict], spot: float) -> None:
-    path = os.path.join(RESULTS_DIR, "top_policies.csv")
+def _save_top_policies_csv(ranked: list[dict], spot: float, tag: str = "") -> None:
+    path = os.path.join(RESULTS_DIR, f"top_policies{tag}.csv")
     fieldnames = [
         "rank", "alpha_L", "alpha_S1", "T_L", "T_S1", "base_q1",
         "beta", "d_min_short", "d_min_long", "eta_pct",
@@ -192,8 +193,8 @@ def _save_top_policies_csv(ranked: list[dict], spot: float) -> None:
 
 
 def _save_best_policy_json(best: dict, spot: float, delta_floor: float,
-                           lambda_: float = 1.0) -> None:
-    path = os.path.join(RESULTS_DIR, "best_policy.json")
+                           lambda_: float = 1.0, tag: str = "") -> None:
+    path = os.path.join(RESULTS_DIR, f"best_policy{tag}.json")
     p = best["policy"]
     data = {
         "policy": {
@@ -231,12 +232,13 @@ def _save_best_policy_json(best: dict, spot: float, delta_floor: float,
         json.dump(data, f, indent=2)
 
 
-def _save_terminal_distributions(best: dict, benchmarks: dict = None) -> None:
+def _save_terminal_distributions(best: dict, benchmarks: dict = None,
+                                  tag: str = "") -> None:
     """Save per-path terminal improvement for options and benchmarks."""
     # Options improvement (W + Pi_T)
     imp = best["improvement"]
     W   = best["W_final"]
-    path_csv = os.path.join(RESULTS_DIR, "path_distribution.csv")
+    path_csv = os.path.join(RESULTS_DIR, f"path_distribution{tag}.csv")
     with open(path_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         header = ["path_idx", "W_final", "improvement"]
@@ -250,8 +252,8 @@ def _save_terminal_distributions(best: dict, benchmarks: dict = None) -> None:
                 row.append(round(float(sl_imp[i]), 4))
             w.writerow(row)
 
-    np.save(os.path.join(RESULTS_DIR, "W_final_best.npy"), W)
-    np.save(os.path.join(RESULTS_DIR, "improvement_best.npy"), imp)
+    np.save(os.path.join(RESULTS_DIR, f"W_final_best{tag}.npy"), W)
+    np.save(os.path.join(RESULTS_DIR, f"improvement_best{tag}.npy"), imp)
     if benchmarks and "stop_loss" in benchmarks:
-        np.save(os.path.join(RESULTS_DIR, "improvement_stoploss.npy"),
+        np.save(os.path.join(RESULTS_DIR, f"improvement_stoploss{tag}.npy"),
                 benchmarks["stop_loss"]["improvement"])

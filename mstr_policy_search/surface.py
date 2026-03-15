@@ -77,6 +77,40 @@ class FrozenSurface:
             setattr(self, f"_mn_grid_{side}", mn_grid)
             setattr(self, f"_days_grid_{side}", days_grid)
 
+        # ── IV surface (from chain 'iv' column) ──────────────────────────────────
+        # IV is dimensionless; does NOT need the S_sim/spot0 homogeneity scaling.
+        # Filter: require iv > 0.001 (0.1% annualised) to exclude invalid entries.
+        self._has_iv_surface = False
+        if "iv" in df.columns:
+            df_iv = df[df["iv"] > 0.001].copy()
+            if len(df_iv) >= 4:                    # need at least a 2×2 grid
+                pivot_iv = (
+                    df_iv.groupby(["moneyness", "days_out"])["iv"]
+                    .mean()
+                    .unstack("days_out")
+                )
+                pivot_iv = pivot_iv.sort_index(axis=0).sort_index(axis=1)
+                mn_grid_iv   = pivot_iv.index.values.astype(float)
+                days_grid_iv = pivot_iv.columns.values.astype(float)
+                values_iv    = pivot_iv.values
+
+                df_fill_iv = pd.DataFrame(values_iv, index=mn_grid_iv,
+                                          columns=days_grid_iv)
+                df_fill_iv = df_fill_iv.ffill(axis=0).bfill(axis=0)
+                df_fill_iv = df_fill_iv.ffill(axis=1).bfill(axis=1)
+                values_iv  = df_fill_iv.values.clip(0.001)   # IV must be positive
+
+                self._interp_iv    = RegularGridInterpolator(
+                    (mn_grid_iv, days_grid_iv),
+                    values_iv,
+                    method="linear",
+                    bounds_error=False,
+                    fill_value=None,              # nearest-edge extrapolation
+                )
+                self._mn_grid_iv   = mn_grid_iv
+                self._days_grid_iv = days_grid_iv
+                self._has_iv_surface = True
+
         # Store raw df for snap_strike
         self._df = df
 
@@ -128,6 +162,41 @@ class FrozenSurface:
         prices = interp(pts)
         prices = prices * (S_vec / self.spot0)      # homogeneity scaling
         return np.maximum(prices, 0.0)
+
+    # ── IV vector lookup (used for vol-scaled roll pricing) ──────────────────
+    def iv_vector(
+        self,
+        K_vec:    np.ndarray,   # shape (n,)  target strikes
+        T_vec:    np.ndarray,   # shape (n,) or scalar  days remaining
+        S_vec:    np.ndarray,   # shape (n,)  simulated spot
+    ) -> np.ndarray:
+        """
+        Return implied vol at (K, T) interpolated from the chain IV surface.
+
+        IV is dimensionless (annualised, e.g. 1.5 = 150%/yr).  Unlike prices,
+        IV does NOT scale with S_sim — no homogeneity correction is applied.
+
+        Output is clipped to [0.05, 5.0] to guard against extrapolation
+        artefacts at the grid edges.
+
+        Raises RuntimeError if no IV surface was built (chain lacked 'iv' data).
+        """
+        if not self._has_iv_surface:
+            raise RuntimeError(
+                "No IV surface available — chain data did not contain a valid 'iv' column."
+            )
+        moneyness = K_vec / np.maximum(S_vec, 1e-6)
+
+        if np.isscalar(T_vec):
+            T_vec = np.full_like(moneyness, float(T_vec))
+
+        mn_q   = np.clip(moneyness, self._mn_grid_iv.min(), self._mn_grid_iv.max())
+        days_q = np.clip(np.asarray(T_vec, dtype=float),
+                         self._days_grid_iv.min(), self._days_grid_iv.max())
+
+        pts = np.stack([mn_q, days_q], axis=1)
+        iv  = self._interp_iv(pts)
+        return np.clip(iv, 0.05, 5.0)
 
     # ── snap to nearest liquid strike in original chain ───────────────────
     def snap_strike(

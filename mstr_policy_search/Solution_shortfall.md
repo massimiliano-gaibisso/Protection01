@@ -1,0 +1,17 @@
+
+Here is a prioritized shortfall table, focused on what matters most for decision reliability:
+
+| # | Priority | Shortfall | Impact on results | Potential fix |
+|---|---|---|---|---|
+| 1 | **Critical** | **Frozen vol surface** — IV fixed at spot=$133. In a crash IV spikes 100-200%, making long puts far more valuable than the model shows | Underestimates crash protection value; policy may be LESS aggressive than optimal | Stochastic vol surface (e.g. SABR or SVI recalibrated per scenario) |
+| 2 | **Critical** | **I.I.D. bootstrap** — no vol clustering, no GARCH, no serial dependence | Underestimates probability of multi-day crash cascades; bootstrap paths too "smooth" vs. reality | Block bootstrap (preserve clusters) or GARCH-filtered residuals |
+| 3 | **High** | **BTC-era only (1,399 days)** — entire pool is from a single bull regime; mean +0.17%/day is not guaranteed | CVaR results overstated relative to a neutral or bear regime | Run in parallel with full history and with synthetic stressed scenarios |
+| 4 | **High** | **LAMBDA=1.0 is arbitrary** — the crash/drag trade-off is a user preference, not optimized | The "best" policy is best only under this specific weighting; another LAMBDA gives a different policy | Sweep LAMBDA and plot the efficient frontier (CVaR_20_imp vs. E_drag Pareto curve) |
+| 5 | **Medium** | **Coordinate ascent finds local optima** — 50 random seeds + 15 starts mitigate but do not guarantee global optimum | True global optimum may have a materially higher score | Global search (simulated annealing, Bayesian optimisation) or denser random initialization |
+| 6 | **Medium** | **Degree-1 homogeneity approximation** — put prices scaled linearly with S; true surface has vol-skew curvature and non-linear S-dependence | Misprices OTM short puts in extreme bull runs and deep-crash long puts | Recalibrate surface from live chain at regular time steps (rolling surface) |
+| 7 | **Medium** | **No margin or capital requirement** — short puts require posted collateral; margin calls in a crash can force unwind at worst prices | Real P&L may be worse than modelled if margin forces liquidation | Add a margin model (e.g. 20% of notional) and reject policies that breach a capital cap |
+| 8 | **Medium** | **Single position size (1 share)** — no delta management, no rebalancing, no leverage | Ignores wealth-dependent effects; underestimates re-investment decisions | Fractional share model with continuous rebalancing or Kelly-sized overlay |
+| 9 | **Low** | **American exercise ignored** — model treats puts as European; deep-ITM puts may be exercised early, especially if S crashes permanently | Slightly underestimates intrinsic value recovery in permanent-crash paths | Price via binomial tree or add early-exercise premium correction |
+| 10 | **Low** | **Fixed 2-year horizon** — no analysis of path-dependency across different holding periods | Optimal policy may differ for a 1-year or 3-year investor | Sweep horizon (252, 504, 756 days) and check policy stability |
+
+**Bottom line:** Items 1 and 2 are the most structurally dangerous — a frozen surface and i.i.d. draws mean the model is simultaneously optimistic about crash protection (IV doesn't spike in simulation) and optimistic about path smoothness (no volatility clustering). Both biases favor the appearance of better performance than a live deployment would deliver. Items 3 and 4 are the next priority for sensitivity analysis before any real capital deployment.

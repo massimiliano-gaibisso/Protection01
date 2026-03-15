@@ -1,0 +1,32 @@
+{
+  "policy": {
+    "alpha_L": 1.15,
+    "alpha_S1": 0.5,
+    "T_L": 34,
+    "T_S1": 69,
+    "base_q1": 0,
+    "beta": 0.25,
+    "d_min_short": 60,
+    "d_min_long": 28,
+    "eta_pct": -0.2
+  },
+  "strikes_at_current_spot": {
+    "K_L": 153.56,
+    "K_S1": 66.77
+  },
+  "metrics": {
+    "P_success": 0.9475,
+    "E_W": 432.1399,
+    "CVaR_W": -353.6929,
+    "P_W_positive": 0.926,
+    "E_breach_depth": 26.7664,
+    "n_rolls": 140.0,
+    "CVaR_20_improvement": 187.4707,
+    "E_drag": 12.5669,
+    "score": 174.9038
+  },
+  "optimizer_params": {
+    "delta_floor": 0.8,
+    "lambda": 1.0
+  }
+}

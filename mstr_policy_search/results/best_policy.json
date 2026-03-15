@@ -1,29 +1,29 @@
 {
   "policy": {
-    "alpha_L": 1.15,
-    "alpha_S1": 0.45,
-    "T_L": 34,
-    "T_S1": 467,
+    "alpha_L": 0.95,
+    "alpha_S1": 0.15,
+    "T_L": 286,
+    "T_S1": 286,
     "base_q1": 1,
-    "beta": 0.5,
-    "d_min_short": 35,
-    "d_min_long": 21,
-    "eta_pct": -0.15
+    "beta": 1.0,
+    "d_min_short": 1,
+    "d_min_long": 7,
+    "eta_pct": -0.5
   },
   "strikes_at_current_spot": {
-    "K_L": 153.56,
-    "K_S1": 60.09
+    "K_L": 126.85,
+    "K_S1": 20.03
   },
   "metrics": {
-    "P_success": 0.901,
-    "E_W": 206.5944,
-    "CVaR_W": -648.6255,
-    "P_W_positive": 0.8655,
-    "E_breach_depth": 18.1034,
-    "n_rolls": 39.0,
-    "CVaR_20_improvement": 172.7156,
-    "E_drag": 38.61,
-    "score": 134.1056
+    "P_success": 0.0,
+    "E_W": -45.446,
+    "CVaR_W": -168.2312,
+    "P_W_positive": 0.237,
+    "E_breach_depth": 38.5844,
+    "n_rolls": 9.22,
+    "CVaR_20_improvement": 72.0288,
+    "E_drag": 23.9655,
+    "score": 48.0633
   },
   "optimizer_params": {
     "delta_floor": 0.8,
